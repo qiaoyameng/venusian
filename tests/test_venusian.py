@@ -936,6 +936,241 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[1]["ob"], subclassing.Super)
 
 
+class TestNamespacePackage(unittest.TestCase):
+    # PEP 420 namespace packages (no ``__init__.py``) may be split across
+    # several directories and zip files on ``sys.path``.  A scan must
+    # recurse over the package's effective ``__path__``, execute duplicate
+    # module names only once (the winner of the real import search), honor
+    # ignores before any import happens, and not carry visited-path state
+    # over into the next scan.
+
+    nspkg_name = "venusian_test_nspkg"
+
+    marker_name = "venusian_test_markerstore"
+
+    def _marker_source(self):
+        return "IMPORTED = set()\n"
+
+    def _module_source(self, fullname):
+        label = "cb_" + fullname.replace(".", "_")
+        return (
+            "import venusian\n"
+            "from %(m)s import IMPORTED\n"
+            "IMPORTED.add(%(fullname)r)\n"
+            "\n"
+            "def _register(wrapped):\n"
+            "    def _callback(context, name, ob):\n"
+            "        context.found(ob.__module__)\n"
+            "    venusian.attach(wrapped, _callback)\n"
+            "    return wrapped\n"
+            "\n"
+            "@_register\n"
+            "def %(label)s():\n"
+            "    pass\n"
+            % {"m": self.marker_name, "label": label, "fullname": fullname}
+        )
+
+    def _write_module(self, root, *parts):
+        path = os.path.join(root, self.nspkg_name, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rel = parts[:-1] + (os.path.splitext(parts[-1])[0],)
+        fullname = self.nspkg_name + "." + ".".join(rel)
+        with open(path, "w") as f:
+            f.write(self._module_source(fullname))
+
+    def _build_portions(self, tmp):
+        import zipfile
+
+        part1 = os.path.join(tmp, "part1")
+        part2 = os.path.join(tmp, "part2")
+        nsdir1 = os.path.join(part1, self.nspkg_name)
+        nsdir2 = os.path.join(part2, self.nspkg_name)
+        os.makedirs(nsdir1)
+        os.makedirs(nsdir2)
+        # deliberately no __init__.py: this is a PEP 420 namespace package
+        for root in (part1, part2):
+            with open(
+                os.path.join(root, self.marker_name + ".py"), "w"
+            ) as f:
+                f.write(self._marker_source())
+        self._write_module(part1, "onlyone.py")
+        self._write_module(part2, "onlytwo.py")
+        # same module name contributed by both filesystem portions
+        self._write_module(part1, "shared.py")
+        # the later portion's copy loses the real import search; its body
+        # records a distinct marker that must never be observed
+        with open(os.path.join(nsdir2, "shared.py"), "w") as f:
+            f.write(
+                "from %s import IMPORTED\n"
+                "IMPORTED.add('LOSING_SHARED')\n" % self.marker_name
+            )
+        # ordinary subpackage (has an __init__.py) inside a portion
+        os.makedirs(os.path.join(nsdir1, "regular"))
+        with open(os.path.join(nsdir1, "regular", "__init__.py"), "w") as f:
+            f.write("")
+        self._write_module(part1, "regular", "inner.py")
+        # namespace subpackage (still no __init__.py) in both portions
+        os.makedirs(os.path.join(nsdir1, "space"))
+        os.makedirs(os.path.join(nsdir2, "space"))
+        self._write_module(part1, "space", "x.py")
+        self._write_module(part2, "space", "y.py")
+        # a third portion living in a zip file, with an ordinary subpackage
+        zp = os.path.join(tmp, "plugins.zip")
+        with zipfile.ZipFile(zp, "w") as zf:
+            # zip portions need an explicit directory entry to be found
+            zf.writestr(self.nspkg_name + "/", "")
+            zf.writestr(
+                self.marker_name + ".py", self._marker_source()
+            )
+            zf.writestr(
+                self.nspkg_name + "/ziponly.py",
+                self._module_source(self.nspkg_name + ".ziponly"),
+            )
+            zf.writestr(self.nspkg_name + "/zpkg/__init__.py", "")
+            zf.writestr(
+                self.nspkg_name + "/zpkg/zinner.py",
+                self._module_source(self.nspkg_name + ".zpkg.zinner"),
+            )
+        return part1, part2, zp
+
+    def _purge_modules(self):
+        n = self.nspkg_name
+        for name in list(sys.modules):
+            if (
+                name == n
+                or name.startswith(n + ".")
+                or name == self.marker_name
+            ):
+                del sys.modules[name]
+
+    def _reset_marker(self):
+        marker = __import__(self.marker_name)
+        marker.IMPORTED = set()
+        return marker
+
+    def _scan_once(self):
+        nspkg = __import__(self.nspkg_name)
+        marker = sys.modules[self.marker_name]
+        found = []
+        scanner = self._makeOne(found=found.append)
+        scanner.scan(nspkg)
+        return nspkg, marker, found
+
+    def _makeOne(self, **kw):
+        from venusian import Scanner
+
+        return Scanner(**kw)
+
+    def _expected_modules(self):
+        n = self.nspkg_name
+        return {
+            n + ".onlyone",
+            n + ".onlytwo",
+            n + ".shared",
+            n + ".regular.inner",
+            n + ".space.x",
+            n + ".space.y",
+            n + ".ziponly",
+            n + ".zpkg.zinner",
+        }
+
+    def test_namespace_portions_two_scans(self):
+        import importlib
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        part1, part2, zp = self._build_portions(tmp)
+        n = self.nspkg_name
+        entries = [part1, part2, zp]
+        for entry in reversed(entries):
+            sys.path.insert(0, entry)
+        try:
+            importlib.invalidate_caches()
+            self._purge_modules()
+            self._reset_marker()
+            nspkg, marker1, found1 = self._scan_once()
+            # the effective search path merges both dirs and the zip
+            self.assertEqual(
+                list(nspkg.__path__),
+                [
+                    os.path.join(part1, n),
+                    os.path.join(part2, n),
+                    os.path.join(zp, n),
+                ],
+            )
+            # duplicate name resolves exactly like a real import (part1 wins)
+            shared = __import__(n + ".shared", fromlist=["x"])
+            self.assertEqual(
+                os.path.realpath(shared.__file__),
+                os.path.realpath(os.path.join(part1, n, "shared.py")),
+            )
+            # second scan must be complete; visited paths belong to one scan
+            nspkg2, marker2, found2 = self._scan_once()
+        finally:
+            for entry in entries:
+                sys.path.remove(entry)
+            importlib.invalidate_caches()
+            self._purge_modules()
+        self.assertEqual(set(found1), self._expected_modules())
+        self.assertEqual(set(found2), self._expected_modules())
+        # First-scan side effects: every winning module body ran exactly
+        # once; the losing part2/shared.py marker never appears.
+        self.assertEqual(marker1.IMPORTED, self._expected_modules())
+        # Second scan hits already-cached modules, so their bodies are not
+        # re-executed: the recorded side effects are unchanged and complete.
+        self.assertIs(marker1, marker2)
+        self.assertEqual(marker2.IMPORTED, self._expected_modules())
+        self.assertIs(nspkg, nspkg2)
+        # the losing part2/shared.py was never imported
+        self.assertNotIn("LOSING_SHARED", marker2.IMPORTED)
+
+    def test_ignore_before_import(self):
+        import importlib
+        import tempfile
+
+        tmp = tempfile.mkdtemp()
+        part1, part2, zp = self._build_portions(tmp)
+        n = self.nspkg_name
+        entries = [part1, part2, zp]
+        for entry in reversed(entries):
+            sys.path.insert(0, entry)
+        try:
+            importlib.invalidate_caches()
+            self._purge_modules()
+            nspkg = __import__(n)
+            marker = self._reset_marker()
+            found = []
+            scanner = self._makeOne(found=found.append)
+            scanner.scan(
+                nspkg,
+                ignore=[
+                    ".onlytwo",  # module in the second directory portion
+                    ".regular",  # ordinary subpackage and its children
+                    ".space",  # namespace subpackage and its children
+                    re.compile(r"\.zinner$").search,
+                ],
+            )
+        finally:
+            for entry in entries:
+                sys.path.remove(entry)
+            importlib.invalidate_caches()
+            self._purge_modules()
+        self.assertEqual(
+            set(found),
+            {n + ".onlyone", n + ".shared", n + ".ziponly"},
+        )
+        # ignored modules were never imported: no import side effects
+        for not_imported in (
+            n + ".onlytwo",
+            n + ".regular.inner",
+            n + ".space.x",
+            n + ".space.y",
+            n + ".zpkg.zinner",
+        ):
+            self.assertNotIn(not_imported, marker.IMPORTED)
+            self.assertNotIn(not_imported, sys.modules)
+
+
 class Test_lift(unittest.TestCase):
     def _makeOne(self, categories=None):
         from venusian import lift

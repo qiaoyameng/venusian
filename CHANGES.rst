@@ -3,6 +3,15 @@
 
 - Remove support for Python 3.7 and 3.8.
 
+- ``Scanner.scan`` now discovers PEP 420 namespace packages (packages without
+  an ``__init__.py``) split across several directories or zip files, along
+  with the regular and namespace subpackages inside them.  Duplicate module
+  names are executed only once, using the winner of the real import search
+  order.  Loaders without ``get_filename`` (such as namespace loaders) are no
+  longer required to provide one, visited paths are scoped to a single scan,
+  and ``ignore`` rules are applied before ignored packages or modules are
+  imported.
+
 3.1.1 (2024-12-01)
 ------------------
 

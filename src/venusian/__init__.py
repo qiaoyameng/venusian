@@ -1,6 +1,7 @@
 import sys
+import os
 from inspect import getmembers, getmro, isclass
-from pkgutil import iter_modules
+from pkgutil import get_importer, iter_modules
 
 from venusian.advice import getFrameInfo
 from venusian.compat import compat_find_loader
@@ -202,17 +203,24 @@ class Scanner(object):
             )
 
             for importer, modname, ispkg in results:
-                loader = compat_find_loader(importer, modname)
-                if loader is not None:  # happens on pypy with orphaned pyc
+                if ispkg:
+                    # walk_packages imports every package before yielding it,
+                    # including PEP 420 namespace packages (whose loader has
+                    # no ``get_filename``).  Use the module object selected by
+                    # the real import machinery.
+                    module = sys.modules.get(modname)
+                    if module is not None:
+                        for name, ob in getmembers(module, None):
+                            invoke(modname, name, ob)
+                else:
+                    loader = compat_find_loader(importer, modname)
+                    if loader is None:
+                        # happens on pypy with orphaned pyc files
+                        continue
                     try:
-                        get_filename = getattr(loader, "get_filename", None)
-                        if get_filename is None:  # pragma: nocover
-                            get_filename = loader._get_filename
-                        try:
-                            fn = get_filename(modname)
-                        except TypeError:  # pragma: nocover
-                            fn = get_filename()
-
+                        # Importing does not rely on ``loader.get_filename``:
+                        # some loaders (PEP 420 namespace loaders, custom or
+                        # extension loaders) do not provide it at all.
                         # NB: use __import__(modname) rather than
                         # loader.load_module(modname) to prevent
                         # inappropriate double-execution of module code
@@ -378,40 +386,110 @@ def walk_packages(path=None, prefix="", onerror=None, ignore=None):
     # NB: we can't just use pkgutils.walk_packages because we need to ignore
     # things
     """
+    seen_paths = set()
+    seen_names = set()
 
-    def seen(p, m={}):
-        if p in m:  # pragma: no cover
-            return True
-        m[p] = True
+    def has_init(directory):
+        return any(
+            os.path.isfile(os.path.join(directory, "__init__" + suffix))
+            for suffix in (".py", ".pyc")
+        )
 
-    # iter_modules is nonrecursive
-    for importer, name, ispkg in iter_modules(path, prefix):
-        if ignore is not None and ignore(name):
-            # if name is a package, ignoring here will cause
-            # all subpackages and submodules to be ignored too
-            continue
-
-        # do any onerror handling before yielding
-
-        if ispkg:
+    def namespace_infos(entry, prefix):
+        # ``iter_modules`` only reports regular packages (those carrying an
+        # __init__).  PEP 420 namespace subpackages -- directories without an
+        # __init__ that merge into the parent namespace -- are not reported,
+        # so discover them the way the import machinery does.  Filesystem
+        # finders expose such directories through ``find_spec`` with a ``None``
+        # loader; zip importers do not support implicit namespace portions.
+        if not isinstance(entry, str) or not os.path.isdir(entry):
+            return
+        importer = get_importer(entry)
+        if importer is None or not hasattr(importer, "find_spec"):
+            return
+        try:
+            children = sorted(os.listdir(entry))
+        except OSError:
+            return
+        for child in children:
+            child_path = os.path.join(entry, child)
+            if not os.path.isdir(child_path) or child == "__pycache__":
+                continue
+            if has_init(child_path):
+                # regular package; iter_modules already reports it
+                continue
+            fullname = prefix + child
             try:
-                __import__(name)
-            except Exception:
-                if onerror is not None:
-                    onerror(name)
+                spec = importer.find_spec(fullname)
+            except (ImportError, ValueError):
+                spec = None
+            if (
+                spec is not None
+                and spec.loader is None
+                and spec.submodule_search_locations
+            ):
+                yield importer, fullname, True
+
+    def _walk(path, prefix):
+        # Visit path entries in the import machinery's search order.  Each
+        # module name is processed only once, from the first entry providing
+        # it -- exactly what a real import picks.  This lets a PEP 420
+        # namespace package span several path entries without executing a
+        # same-named module from a later portion a second time.
+        yielded_at_level = set()
+        for entry in path:
+            infos = list(iter_modules([entry], prefix))
+            infos.extend(namespace_infos(entry, prefix))
+            infos.sort(key=lambda info: info[1])
+
+            for importer, name, ispkg in infos:
+                if name in yielded_at_level:
+                    # shadowed by an earlier path entry
+                    continue
+                yielded_at_level.add(name)
+
+                if ignore is not None and ignore(name):
+                    # if name is a package, ignoring here causes all of its
+                    # subpackages and submodules to be ignored too; the object
+                    # is never imported
+                    continue
+
+                if name in seen_names:
+                    continue
+
+                # do any onerror handling before yielding
+
+                if ispkg:
+                    try:
+                        __import__(name)
+                    except Exception:
+                        if onerror is not None:
+                            onerror(name)
+                        else:
+                            raise
+                    else:
+                        seen_names.add(name)
+                        yield importer, name, ispkg
+                        subpath = getattr(
+                            sys.modules[name], "__path__", None
+                        ) or []
+
+                        # namespace packages gain portions from every path
+                        # entry; preserve the import machinery's search order
+                        subpath = list(dict.fromkeys(subpath))
+
+                        # don't traverse path items seen earlier in this scan
+                        subpath = [p for p in subpath if p not in seen_paths]
+                        seen_paths.update(subpath)
+
+                        for item in _walk(subpath, name + "."):
+                            yield item
                 else:
-                    raise
-            else:
-                yield importer, name, ispkg
-                path = getattr(sys.modules[name], "__path__", None) or []
+                    seen_names.add(name)
+                    yield importer, name, ispkg
 
-                # don't traverse path items we've seen before
-                path = [p for p in path if not seen(p)]
-
-                for item in walk_packages(path, name + ".", onerror, ignore):
-                    yield item
-        else:
-            yield importer, name, ispkg
+    for item in _walk(path, prefix):
+        yield item
 
 
 class lift(object):
