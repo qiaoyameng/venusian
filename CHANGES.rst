@@ -1,6 +1,13 @@
 3.2.0 (unreleased)
 ------------------
 
+- Add ``venusian.ScanSession`` and a ``session`` argument to
+  ``Scanner.scan``.  Reusing a session across scans deduplicates callback
+  execution: only newly attached (or previously failed or
+  category-filtered) callbacks are invoked on subsequent scans.  Attachment
+  identities are tracked with weak references, so reloaded modules are
+  re-registered and old objects remain garbage collectable.
+
 - Remove support for Python 3.7 and 3.8.
 
 3.1.1 (2024-12-01)

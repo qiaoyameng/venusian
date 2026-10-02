@@ -1,4 +1,5 @@
 import sys
+import weakref
 from inspect import getmembers, getmro, isclass
 from pkgutil import iter_modules
 
@@ -9,11 +10,73 @@ ATTACH_ATTR = "__venusian_callbacks__"
 LIFTONLY_ATTR = "__venusian_liftonly_callbacks__"
 
 
+class ScanSession(object):
+    """Records the identities of venusian attachments whose callbacks have
+    been successfully executed during a scan, so that repeated scans of the
+    same package only invoke newly attached callbacks.
+
+    Pass an instance to :meth:`venusian.Scanner.scan` via its ``session``
+    argument and reuse it across scans which should share deduplication
+    state.  Each session tracks its own state; sessions never share
+    deduplication state with each other.  Call :meth:`clear` to forget all
+    previously recorded attachments.
+
+    An attachment is identified by the object it is attached to (not merely
+    by module and object names), so reloaded modules whose same-named
+    objects are brand new objects will have their callbacks invoked again.
+    Identities are tracked through weak references: scanned objects are
+    never kept alive by the session, and once an object is garbage
+    collected its recorded executions are forgotten.  Objects which do not
+    support weak references cannot be tracked; their callbacks are invoked
+    on every scan.
+
+    Only successfully executed callbacks are recorded.  A callback which
+    raises an exception is not marked as done and will be invoked again by
+    a subsequent scan using the same session.  Likewise, attachments
+    skipped because of ``categories`` filtering are not recorded and remain
+    eligible for later scans.
+
+    .. versionadded:: 3.2.0
+    """
+
+    def __init__(self):
+        # maps id(ob) -> (weakref to ob, set of (category, index) keys)
+        self._executed = {}
+
+    def clear(self):
+        """Forget all recorded attachments; the next scan using this
+        session will invoke every callback again."""
+        self._executed.clear()
+
+    def _executed_keys(self, ob):
+        # Return the mutable set of execution keys recorded for ``ob``, or
+        # ``None`` if ``ob`` cannot be tracked (no weakref support).
+        oid = id(ob)
+        entry = self._executed.get(oid)
+        if entry is not None:
+            ref, keys = entry
+            if ref() is ob:
+                return keys
+            # stale entry whose id was reused by another object
+            del self._executed[oid]
+
+        def _forgotten(ref, executed=self._executed, oid=oid):
+            executed.pop(oid, None)
+
+        try:
+            ref = weakref.ref(ob, _forgotten)
+        except TypeError:
+            return None
+        keys = set()
+        self._executed[oid] = (ref, keys)
+        return keys
+
+
 class Scanner(object):
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
-    def scan(self, package, categories=None, onerror=None, ignore=None):
+    def scan(self, package, categories=None, onerror=None, ignore=None, session=None):
         """Scan a Python package and any of its subpackages.  All
         top-level objects will be considered; those marked with
         venusian callback attributes related to ``category`` will be
@@ -100,6 +163,16 @@ class Scanner(object):
 
         .. versionadded:: 1.0a3
            the ``ignore`` argument
+
+        The ``session`` argument should be ``None`` (the default) or an
+        instance of :class:`venusian.ScanSession`.  When a session is
+        supplied, attachments whose callbacks were already successfully
+        executed during an earlier scan using the same session are skipped,
+        so repeated scans of the same package only process newly attached
+        callbacks.
+
+        .. versionadded:: 3.2.0
+           the ``session`` argument
         """
 
         pkg_name = package.__name__
@@ -173,15 +246,26 @@ class Scanner(object):
                     category_keys.sort()
                 except TypeError:  # pragma: no cover
                     return
+            executed = None
+            if session is not None:
+                executed = session._executed_keys(ob)
             for category in category_keys:
                 callbacks = attached_categories.get(category, [])
                 try:
                     # Metaclasses might trick us by reaching this far and then
                     # fail with too little values to unpack.
-                    for callback, cb_mod_name, liftid, scope in callbacks:
+                    for index, callback_info in enumerate(callbacks):
+                        callback, cb_mod_name, liftid, scope = callback_info
                         if cb_mod_name != mod_name:
                             # avoid processing objects that were imported into
                             # this module but were not actually defined there
+                            continue
+                        if executed is not None:
+                            key = (category, index)
+                            if key in executed:
+                                continue
+                            callback(self, name, ob)
+                            executed.add(key)
                             continue
                         callback(self, name, ob)
                 except ValueError:  # pragma: nocover

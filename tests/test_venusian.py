@@ -936,6 +936,152 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[1]["ob"], subclassing.Super)
 
 
+class TestScanSession(unittest.TestCase):
+    def _makeOne(self, **kw):
+        from venusian import Scanner
+
+        return Scanner(**kw)
+
+    def _makeSession(self):
+        from venusian import ScanSession
+
+        return ScanSession()
+
+    def _append_callback(self, ob, mod_name, callback):
+        from venusian import ATTACH_ATTR
+
+        categories = getattr(ob, ATTACH_ATTR)
+        liftid = "%s %s" % (getattr(ob, "__name__", None), None)
+        categories.setdefault(None, []).append((callback, mod_name, liftid, "module"))
+
+    def test_consecutive_scans_only_process_new_attachments(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        session = self._makeSession()
+        scanner.scan(one, session=session)
+        self.assertEqual(len(test.registrations), 6)
+        scanner.scan(one, session=session)
+        self.assertEqual(len(test.registrations), 6)
+        # without a session every callback is invoked again
+        scanner.scan(one)
+        self.assertEqual(len(test.registrations), 12)
+
+    def test_appended_attachment_is_processed_on_next_scan(self):
+        from tests.fixtures.sessionpkg import mutable
+
+        calls = []
+
+        def appended(scanner, name, ob):
+            calls.append((name, ob))
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        session = self._makeSession()
+        scanner.scan(mutable, session=session)
+        self.assertEqual(len(test.registrations), 2)
+        self._append_callback(mutable.function, mutable.__name__, appended)
+        scanner.scan(mutable, session=session)
+        # only the newly appended callback ran; nothing was re-invoked
+        self.assertEqual(len(test.registrations), 2)
+        self.assertEqual(calls, [("function", mutable.function)])
+        scanner.scan(mutable, session=session)
+        self.assertEqual(len(calls), 1)
+
+    def test_reload_module_reregisters_and_old_objects_are_collectable(self):
+        import gc
+        import weakref
+        from importlib import reload
+
+        from tests.fixtures.sessionpkg import mod
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        session = self._makeSession()
+        scanner.scan(mod, session=session)
+        self.assertEqual(len(test.registrations), 1)
+        old_function = mod.function
+        old_ref = weakref.ref(old_function)
+        reload(mod)
+        self.assertIsNot(mod.function, old_function)
+        # drop strong references acquired before the reload
+        del test.registrations[:]
+        del old_function
+        gc.collect()
+        # the session must not keep the reloaded-away object alive
+        self.assertIsNone(old_ref())
+        # the reloaded module's same-named object is a new attachment
+        scanner.scan(mod, session=session)
+        self.assertEqual(len(test.registrations), 1)
+        self.assertIs(test.registrations[0]["ob"], mod.function)
+
+    def test_failed_callback_is_not_marked_done(self):
+        from tests.fixtures.sessionpkg import mutable
+
+        calls = []
+        state = {"fail": True}
+
+        def flaky_callback(scanner, name, ob):
+            if state["fail"]:
+                raise RuntimeError("boom")
+            calls.append((name, ob))
+
+        self._append_callback(mutable.flaky, mutable.__name__, flaky_callback)
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        session = self._makeSession()
+        self.assertRaises(RuntimeError, scanner.scan, mutable, session=session)
+        # flaky's own callback ran before the failure, function's did not
+        self.assertEqual(len(test.registrations), 1)
+        state["fail"] = False
+        scanner.scan(mutable, session=session)
+        # the failed callback was retried, the succeeded one was not
+        self.assertEqual(calls, [("flaky", mutable.flaky)])
+        self.assertEqual(len(test.registrations), 2)
+        scanner.scan(mutable, session=session)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(test.registrations), 2)
+
+    def test_category_filter_leaves_unexecuted_attachments(self):
+        from tests.fixtures import category
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        session = self._makeSession()
+        scanner.scan(category, categories=("mycategory",), session=session)
+        self.assertEqual(len(test.registrations), 1)
+        self.assertEqual(test.registrations[0]["name"], "function")
+        scanner.scan(category, session=session)
+        # only the previously filtered-out category was processed
+        self.assertEqual(len(test.registrations), 2)
+        self.assertEqual(test.registrations[1]["name"], "function2")
+
+    def test_sessions_do_not_share_state(self):
+        from tests.fixtures.sessionpkg import mod
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        scanner.scan(mod, session=self._makeSession())
+        self.assertEqual(len(test.registrations), 1)
+        scanner.scan(mod, session=self._makeSession())
+        self.assertEqual(len(test.registrations), 2)
+
+    def test_clear(self):
+        from tests.fixtures.sessionpkg import mod
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        session = self._makeSession()
+        scanner.scan(mod, session=session)
+        self.assertEqual(len(test.registrations), 1)
+        scanner.scan(mod, session=session)
+        self.assertEqual(len(test.registrations), 1)
+        session.clear()
+        scanner.scan(mod, session=session)
+        self.assertEqual(len(test.registrations), 2)
+
+
 class Test_lift(unittest.TestCase):
     def _makeOne(self, categories=None):
         from venusian import lift
