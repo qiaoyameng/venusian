@@ -1,6 +1,14 @@
 3.2.0 (unreleased)
 ------------------
 
+- Split scanning into two optional steps: ``Scanner.collect`` returns a
+  ``ScanPlan`` of ``Registration`` objects (module, object, category,
+  callback source, and execution order) without invoking any callbacks,
+  and ``Scanner.execute`` runs a previously collected plan.  The plan is a
+  snapshot of the bindings found at collection time: callbacks attached
+  later are not included, and stale or reloaded modules are executed from
+  the collected bindings.  ``Scanner.scan`` still performs both steps.
+
 - Remove support for Python 3.7 and 3.8.
 
 3.1.1 (2024-12-01)

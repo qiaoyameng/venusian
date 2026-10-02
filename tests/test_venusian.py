@@ -936,6 +936,162 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[1]["ob"], subclassing.Super)
 
 
+class TestCollectExecute(unittest.TestCase):
+    def _makeOne(self, **kw):
+        from venusian import Scanner
+
+        return Scanner(**kw)
+
+    def test_collect_does_not_invoke_callbacks(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(one)
+        self.assertEqual(test.registrations, [])
+        self.assertEqual(len(plan), 6)
+
+    def test_collect_records_plan_details(self):
+        from tests.fixtures import one
+        from venusian import ScanPlan
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(one)
+        self.assertIsInstance(plan, ScanPlan)
+        self.assertTrue(plan.package is one)
+        self.assertEqual(plan.categories, None)
+        self.assertEqual(len(plan.registrations), 6)
+        for expected_order, registration in enumerate(plan):
+            self.assertEqual(registration.order, expected_order)
+            self.assertTrue(registration.mod_name.startswith("tests.fixtures.one"))
+            self.assertEqual(
+                registration.callback_mod_name, registration.mod_name
+            )
+            self.assertEqual(registration.category, None)
+            self.assertTrue(callable(registration.callback))
+            self.assertTrue(
+                registration.ob
+                is getattr(
+                    sys.modules[registration.mod_name], registration.name
+                )
+            )
+
+    def test_execute_runs_collected_callbacks_in_order(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(one)
+        scanner.execute(plan)
+        self.assertEqual(len(test.registrations), 6)
+        for registration, planned in zip(test.registrations, plan):
+            self.assertEqual(registration["name"], planned.name)
+            self.assertTrue(registration["ob"] is planned.ob)
+
+    def test_scan_is_collect_plus_execute(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        scanner.scan(one)
+        scan_registrations = list(test.registrations)
+
+        test2 = _Test()
+        scanner2 = self._makeOne(test=test2)
+        scanner2.execute(scanner2.collect(one))
+        self.assertEqual(len(scan_registrations), len(test2.registrations))
+        for scanned, collected in zip(scan_registrations, test2.registrations):
+            self.assertEqual(scanned["name"], collected["name"])
+            self.assertTrue(scanned["ob"] is collected["ob"])
+
+    def test_plan_is_snapshot_not_affected_by_later_attach(self):
+        from tests.fixtures import collectplan
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(collectplan, categories=["test"])
+        before = len(plan)
+
+        # attaching a new callback after collection must not change the
+        # already-collected plan
+        collectplan.attach_late()
+        try:
+            self.assertEqual(len(plan), before)
+            scanner.execute(plan)
+            self.assertEqual(len(test.registrations), before)
+            for registration in test.registrations:
+                self.assertEqual(registration["callback"], "callback")
+
+            # a fresh collection sees the newly attached callback
+            test2 = _Test()
+            scanner2 = self._makeOne(test=test2)
+            plan2 = scanner2.collect(collectplan, categories=["test"])
+            self.assertEqual(len(plan2), before + 1)
+            scanner2.execute(plan2)
+            callbacks = [r["callback"] for r in test2.registrations]
+            self.assertEqual(callbacks, ["callback", "late_callback"])
+        finally:
+            # undo the runtime attach so other tests are unaffected
+            from venusian import ATTACH_ATTR
+
+            categories = getattr(collectplan.function, ATTACH_ATTR)
+            categories["test"] = [
+                cb
+                for cb in categories["test"]
+                if cb[0] is not collectplan.late_callback
+            ]
+
+    def test_execute_uses_stale_module_snapshot(self):
+        import types
+
+        from tests.fixtures import collectplan
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(collectplan, categories=["test"])
+
+        # simulate the module becoming stale: a fresh module object under
+        # the same name in sys.modules does not affect the collected plan
+        stale = sys.modules["tests.fixtures.collectplan"]
+        sys.modules["tests.fixtures.collectplan"] = types.ModuleType(
+            "tests.fixtures.collectplan"
+        )
+        try:
+            scanner.execute(plan)
+        finally:
+            sys.modules["tests.fixtures.collectplan"] = stale
+        self.assertEqual(len(test.registrations), len(plan))
+        for registration in test.registrations:
+            self.assertTrue(registration["ob"] is collectplan.function)
+
+    def test_collect_respects_ignore(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(one, ignore=[".module2"])
+        scanner.execute(plan)
+        self.assertEqual(len(test.registrations), 3)
+        for registration in plan:
+            self.assertEqual(
+                registration.mod_name, "tests.fixtures.one.module"
+            )
+
+    def test_collect_respects_categories(self):
+        from tests.fixtures import category
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(category, categories=["mycategory2"])
+        self.assertEqual(len(plan), 1)
+        registration = plan[0]
+        self.assertEqual(registration.category, "mycategory2")
+        self.assertEqual(registration.name, "function2")
+        scanner.execute(plan)
+        self.assertEqual(len(test.registrations), 1)
+
+
 class Test_lift(unittest.TestCase):
     def _makeOne(self, categories=None):
         from venusian import lift

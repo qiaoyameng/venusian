@@ -7,6 +7,14 @@ API Documentation for Venusian
 
      .. automethod:: scan
 
+     .. automethod:: collect
+
+     .. automethod:: execute
+
+  .. autoclass:: ScanPlan
+
+  .. autoclass:: Registration
+
   .. autoclass:: AttachInfo
 
   .. autofunction:: attach(wrapped, callback, category=None, name=None)

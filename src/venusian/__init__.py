@@ -100,8 +100,57 @@ class Scanner(object):
 
         .. versionadded:: 1.0a3
            the ``ignore`` argument
-        """
 
+        ``scan`` is a convenience combination of :meth:`collect` and
+        :meth:`execute`: it collects a :class:`ScanPlan` from ``package``
+        and immediately executes it.  Use :meth:`collect` and
+        :meth:`execute` separately if you need to inspect or modify the
+        planned registrations before the callbacks are run.  If collection
+        raises (for example because ``onerror`` reraises an import error),
+        the callbacks collected up to that point are still executed before
+        the exception propagates, mirroring the historical behavior of
+        ``scan``.
+
+        .. versionadded:: 3.2.0
+           the :meth:`collect` and :meth:`execute` methods
+        """
+        registrations = []
+        try:
+            self._collect(package, categories, onerror, ignore, registrations)
+        except Exception:
+            # execute the callbacks collected before the error, just like
+            # a monolithic scan would have invoked them on the way
+            self.execute(registrations)
+            raise
+        self.execute(registrations)
+
+    def collect(self, package, categories=None, onerror=None, ignore=None):
+        """Collect the Venusian callbacks that would be invoked by a scan
+        of ``package`` into a :class:`ScanPlan`, without invoking them.
+
+        The arguments have the same meaning as for :meth:`scan`, and the
+        same ``ignore`` and ``lift`` rules are applied.
+
+        Note that collecting a plan imports the scanned package's modules
+        exactly like :meth:`scan` does, so module top-level code still runs
+        and may have side effects.  Only the Venusian callbacks attached
+        via :func:`venusian.attach` are deferred: they are recorded in the
+        returned plan instead of being called.
+
+        The returned :class:`ScanPlan` is a snapshot of the bindings found
+        at collection time.  Callbacks attached to objects *after* this
+        method returns are not added to the plan; call :meth:`collect`
+        again to pick them up.
+
+        .. versionadded:: 3.2.0
+        """
+        registrations = []
+        self._collect(package, categories, onerror, ignore, registrations)
+        return ScanPlan(
+            package=package, categories=categories, registrations=registrations
+        )
+
+    def _collect(self, package, categories, onerror, ignore, registrations):
         pkg_name = package.__name__
 
         if ignore is not None and (
@@ -183,7 +232,19 @@ class Scanner(object):
                             # avoid processing objects that were imported into
                             # this module but were not actually defined there
                             continue
-                        callback(self, name, ob)
+                        registrations.append(
+                            Registration(
+                                order=len(registrations),
+                                mod_name=mod_name,
+                                name=name,
+                                ob=ob,
+                                category=category,
+                                callback=callback,
+                                callback_mod_name=cb_mod_name,
+                                liftid=liftid,
+                                scope=scope,
+                            )
+                        )
                 except ValueError:  # pragma: nocover
                     continue
 
@@ -232,6 +293,154 @@ class Scanner(object):
                             loader.file, "close"
                         ):  # pragma: nocover
                             loader.file.close()
+
+    def execute(self, plan):
+        """Execute a :class:`ScanPlan` previously returned by
+        :meth:`collect`, invoking each planned callback in collection
+        order as ``callback(scanner, name, ob)``.
+
+        The plan is a self-contained snapshot: it holds strong references
+        to the module names, objects, and callbacks found when it was
+        collected.  Execution never re-imports modules or re-resolves
+        names through ``sys.modules``.  As a consequence, if a module was
+        reloaded or removed from ``sys.modules`` after the plan was
+        collected, the (now stale) collected bindings are still used, and
+        callbacks attached after collection are not run.  Call
+        :meth:`collect` again to build a fresh plan that reflects the
+        current state.
+
+        .. versionadded:: 3.2.0
+        """
+        for registration in plan:
+            registration.callback(self, registration.name, registration.ob)
+
+
+class Registration(object):
+    """
+    A single planned Venusian callback invocation, created by
+    :meth:`Scanner.collect` as part of a :class:`ScanPlan`.  It has the
+    following attributes:
+
+    ``order``
+
+      The zero-based position of this registration in the plan's
+      execution order.
+
+    ``mod_name``
+
+      The dotted name of the module in which the decorated object was
+      found during the scan.
+
+    ``name``
+
+      The name of the decorated object within its module.
+
+    ``ob``
+
+      The decorated object itself.
+
+    ``category``
+
+      The Venusian category this callback was attached under.
+
+    ``callback``
+
+      The callback callable that will be invoked as
+      ``callback(scanner, name, ob)`` when the plan is executed.
+
+    ``callback_mod_name``
+
+      The dotted name of the module in which the callback was attached
+      (the "source" of the callback).  This is usually the same as
+      ``mod_name``, but differs for callbacks inherited via
+      :class:`venusian.lift`.
+
+    ``liftid``
+
+      The lift identifier used by :class:`venusian.lift` to decide
+      whether a decoration is inherited or overridden.
+
+    ``scope``
+
+      The scope (``exec``, ``module``, ``class``, ``function call`` or
+      ``unknown``) in which the callback was attached.
+
+    .. versionadded:: 3.2.0
+    """
+
+    def __init__(
+        self,
+        order,
+        mod_name,
+        name,
+        ob,
+        category,
+        callback,
+        callback_mod_name,
+        liftid,
+        scope,
+    ):
+        self.order = order
+        self.mod_name = mod_name
+        self.name = name
+        self.ob = ob
+        self.category = category
+        self.callback = callback
+        self.callback_mod_name = callback_mod_name
+        self.liftid = liftid
+        self.scope = scope
+
+    def __repr__(self):
+        return "<Registration #%d %s.%s category=%r callback=%r>" % (
+            self.order,
+            self.mod_name,
+            self.name,
+            self.category,
+            self.callback,
+        )
+
+
+class ScanPlan(object):
+    """
+    An ordered, immutable snapshot of :class:`Registration` objects
+    produced by :meth:`Scanner.collect` and consumed by
+    :meth:`Scanner.execute`.  It has the following attributes:
+
+    ``package``
+
+      The package or module object that was scanned.
+
+    ``categories``
+
+      The ``categories`` argument the plan was collected with (``None``
+      meaning all categories).
+
+    ``registrations``
+
+      A tuple of :class:`Registration` objects in execution order.
+
+    The plan supports iteration, ``len()``, and indexing over its
+    registrations.  Because the plan captures the bindings found at
+    collection time, later calls to :func:`venusian.attach` do not
+    modify it, and it can be executed even if the scanned modules have
+    since been reloaded or removed from ``sys.modules``.
+
+    .. versionadded:: 3.2.0
+    """
+
+    def __init__(self, package, categories, registrations):
+        self.package = package
+        self.categories = categories
+        self.registrations = tuple(registrations)
+
+    def __iter__(self):
+        return iter(self.registrations)
+
+    def __len__(self):
+        return len(self.registrations)
+
+    def __getitem__(self, index):
+        return self.registrations[index]
 
 
 class AttachInfo(object):
