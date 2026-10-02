@@ -3,6 +3,15 @@
 
 - Remove support for Python 3.7 and 3.8.
 
+- Support scanning PEP 420 namespace packages, including namespace
+  packages whose portions are spread over multiple directories and
+  regular or namespace subpackages contained in them.  When the same
+  module name exists in several portions, only the one a real import
+  would choose is scanned.
+
+- Fix ``walk_packages`` leaking its set of already-visited paths into
+  subsequent scans, which could cause later scans to skip packages.
+
 3.1.1 (2024-12-01)
 ------------------
 

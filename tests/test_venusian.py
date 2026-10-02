@@ -138,6 +138,108 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[3]["ob"], subpackage.pkgfunction)
         self.assertEqual(test.registrations[3]["function"], True)
 
+    def test_namespace_package_split_across_directories(self):
+        import shutil
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        portion1 = os.path.join(tmpdir, "portion1")
+        portion2 = os.path.join(tmpdir, "portion2")
+        pkg1 = os.path.join(portion1, "nsfixture")
+        pkg2 = os.path.join(portion2, "nsfixture")
+        os.makedirs(os.path.join(pkg1, "nssub"))
+        os.makedirs(os.path.join(pkg2, "regularsub"))
+
+        def write(path, content):
+            with open(path, "w") as f:
+                f.write(content)
+
+        module_template = (
+            "from tests.fixtures import decorator\n"
+            "\n"
+            "@decorator(function=True)\n"
+            "def %s(request):\n"
+            "    return request\n"
+        )
+        # the same module name exists in both portions; the first
+        # portion on sys.path must win, exactly as a real import
+        write(os.path.join(pkg1, "shared.py"), module_template % "from_portion1")
+        write(os.path.join(pkg2, "shared.py"), module_template % "from_portion2")
+        # modules unique to each portion
+        write(os.path.join(pkg1, "only1.py"), module_template % "only1_function")
+        write(os.path.join(pkg2, "only2.py"), module_template % "only2_function")
+        # a regular subpackage inside one portion
+        write(
+            os.path.join(pkg2, "regularsub", "__init__.py"),
+            module_template % "sub_function",
+        )
+        write(
+            os.path.join(pkg2, "regularsub", "inner.py"),
+            module_template % "inner_function",
+        )
+        # a nested namespace subpackage inside the other portion
+        write(os.path.join(pkg1, "nssub", "deep.py"), module_template % "deep_function")
+        # a module with an import side effect, excluded via ``ignore``
+        write(
+            os.path.join(pkg1, "ignored.py"),
+            "import os\n"
+            "with open(os.path.join(os.path.dirname(__file__),"
+            " 'side_effect.txt'), 'w') as f:\n"
+            "    f.write('imported')\n" + module_template % "ignored_function",
+        )
+        side_effect = os.path.join(pkg1, "side_effect.txt")
+
+        def cleanup_modules():
+            for name in list(sys.modules):
+                if name == "nsfixture" or name.startswith("nsfixture."):
+                    del sys.modules[name]
+
+        self.addCleanup(cleanup_modules)
+
+        # portion1 must be ahead of portion2 on sys.path
+        with with_entry_in_sys_path(portion2):
+            with with_entry_in_sys_path(portion1):
+                import nsfixture.shared  # the real import's choice
+
+                self.assertEqual(os.path.dirname(nsfixture.shared.__file__), pkg1)
+
+                expected = [
+                    "deep_function",
+                    "from_portion1",
+                    "inner_function",
+                    "only1_function",
+                    "only2_function",
+                    "sub_function",
+                ]
+
+                test = _Test()
+                scanner = self._makeOne(test=test)
+                scanner.scan(nsfixture, ignore=[".ignored"])
+                first = list(test.registrations)
+
+                # a second scan over the same package must see the
+                # package fresh: paths visited during the first scan
+                # belong to that scan only
+                test2 = _Test()
+                scanner2 = self._makeOne(test=test2)
+                scanner2.scan(nsfixture, ignore=[".ignored"])
+                second = test2.registrations
+
+        self.assertEqual(sorted(r["name"] for r in first), expected)
+        self.assertEqual(sorted(r["name"] for r in second), expected)
+        # the callbacks registered for the duplicated module name are
+        # the ones of the module a real import would (and did) choose
+        by_name = {}
+        for r in first:
+            by_name.setdefault(r["name"], r["ob"])
+        self.assertIs(by_name["from_portion1"], nsfixture.shared.from_portion1)
+        self.assertNotIn("from_portion2", by_name)
+        # the ignored module was never imported: no sys.modules entry
+        # and no import side effect
+        self.assertNotIn("nsfixture.ignored", sys.modules)
+        self.assertFalse(os.path.exists(side_effect))
+
     def test_module(self):
         from tests.fixtures.one import module
 

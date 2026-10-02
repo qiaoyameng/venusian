@@ -1,6 +1,8 @@
+import os
 import sys
-from inspect import getmembers, getmro, isclass
-from pkgutil import iter_modules
+from importlib.machinery import FileFinder
+from inspect import getmembers, getmodulename, getmro, isclass
+from pkgutil import get_importer, iter_modules
 
 from venusian.advice import getFrameInfo
 from venusian.compat import compat_find_loader
@@ -203,35 +205,46 @@ class Scanner(object):
 
             for importer, modname, ispkg in results:
                 loader = compat_find_loader(importer, modname)
-                if loader is not None:  # happens on pypy with orphaned pyc
-                    try:
-                        get_filename = getattr(loader, "get_filename", None)
-                        if get_filename is None:  # pragma: nocover
-                            get_filename = loader._get_filename
+                if loader is None:
+                    # Namespace packages have no loader (and no filename);
+                    # walk_packages has already imported them, so their
+                    # members can be scanned directly.  A missing loader
+                    # may also mean an orphaned pyc (happens on pypy),
+                    # which cannot be imported at all and is skipped.
+                    module = sys.modules.get(modname)
+                    if module is not None:
+                        for name, ob in getmembers(module, None):
+                            invoke(modname, name, ob)
+                    continue
+                try:
+                    # Some loaders (e.g. custom finders) do not provide
+                    # ``get_filename``; only call it when it exists.
+                    get_filename = getattr(loader, "get_filename", None)
+                    if get_filename is not None:
                         try:
-                            fn = get_filename(modname)
+                            get_filename(modname)
                         except TypeError:  # pragma: nocover
-                            fn = get_filename()
+                            get_filename()
 
-                        # NB: use __import__(modname) rather than
-                        # loader.load_module(modname) to prevent
-                        # inappropriate double-execution of module code
-                        try:
-                            __import__(modname)
-                        except Exception:
-                            if onerror is not None:
-                                onerror(modname)
-                            else:
-                                raise
-                        module = sys.modules.get(modname)
-                        if module is not None:
-                            for name, ob in getmembers(module, None):
-                                invoke(modname, name, ob)
-                    finally:
-                        if hasattr(loader, "file") and hasattr(
-                            loader.file, "close"
-                        ):  # pragma: nocover
-                            loader.file.close()
+                    # NB: use __import__(modname) rather than
+                    # loader.load_module(modname) to prevent
+                    # inappropriate double-execution of module code
+                    try:
+                        __import__(modname)
+                    except Exception:
+                        if onerror is not None:
+                            onerror(modname)
+                        else:
+                            raise
+                    module = sys.modules.get(modname)
+                    if module is not None:
+                        for name, ob in getmembers(module, None):
+                            invoke(modname, name, ob)
+                finally:
+                    if hasattr(loader, "file") and hasattr(
+                        loader.file, "close"
+                    ):  # pragma: nocover
+                        loader.file.close()
 
 
 class AttachInfo(object):
@@ -378,40 +391,132 @@ def walk_packages(path=None, prefix="", onerror=None, ignore=None):
     # NB: we can't just use pkgutils.walk_packages because we need to ignore
     # things
     """
+    # paths traversed during *this* walk only; a fresh set is used for
+    # every top-level call so that a later scan is not affected by the
+    # paths visited during a previous one
+    seen = set()
 
-    def seen(p, m={}):
-        if p in m:  # pragma: no cover
+    def mark_seen(p):
+        if p in seen:  # pragma: no cover
             return True
-        m[p] = True
+        seen.add(p)
+        return False
 
-    # iter_modules is nonrecursive
-    for importer, name, ispkg in iter_modules(path, prefix):
-        if ignore is not None and ignore(name):
-            # if name is a package, ignoring here will cause
-            # all subpackages and submodules to be ignored too
-            continue
+    def walk(path, prefix):
+        # _iter_modules is nonrecursive
+        for importer, name, ispkg in _iter_modules(path, prefix):
+            if ignore is not None and ignore(name):
+                # if name is a package, ignoring here will cause
+                # all subpackages and submodules to be ignored too
+                continue
 
-        # do any onerror handling before yielding
+            # do any onerror handling before yielding
 
-        if ispkg:
-            try:
-                __import__(name)
-            except Exception:
-                if onerror is not None:
-                    onerror(name)
+            if ispkg:
+                try:
+                    __import__(name)
+                except Exception:
+                    if onerror is not None:
+                        onerror(name)
+                    else:
+                        raise
                 else:
-                    raise
+                    yield importer, name, ispkg
+                    subpath = getattr(sys.modules[name], "__path__", None) or []
+
+                    # don't traverse path items we've seen before
+                    subpath = [p for p in subpath if not mark_seen(p)]
+
+                    for item in walk(subpath, name + "."):
+                        yield item
             else:
                 yield importer, name, ispkg
-                path = getattr(sys.modules[name], "__path__", None) or []
 
-                # don't traverse path items we've seen before
-                path = [p for p in path if not seen(p)]
+    return walk(path, prefix)
 
-                for item in walk_packages(path, name + ".", onerror, ignore):
-                    yield item
+
+def _iter_modules(path, prefix):
+    # Like ``pkgutil.iter_modules``, but also reports PEP 420 namespace
+    # packages (directories without an ``__init__`` file) found on
+    # directory path entries, which ``pkgutil.iter_modules`` omits.
+    # Names are yielded at most once: when the same module name is
+    # present in several path entries (e.g. portions of a namespace
+    # package), only the first occurrence is reported, matching the
+    # order in which the real import machinery resolves them.
+    yielded = set()
+    if path is None:
+        path = sys.path
+    for entry in path or []:
+        importer = get_importer(entry)
+        if isinstance(importer, FileFinder):
+            # a plain directory: enumerate it ourselves so that
+            # namespace packages are included
+            results = _iter_dir_modules(importer, prefix)
         else:
-            yield importer, name, ispkg
+            # anything else (e.g. a zipimporter or a custom finder)
+            # knows best how to enumerate its own contents
+            results = iter_modules([entry], prefix)
+        for importer, name, ispkg in results:
+            if name not in yielded:
+                yielded.add(name)
+                yield importer, name, ispkg
+
+
+def _iter_dir_modules(importer, prefix):
+    # Yield (importer, name, ispkg) for the modules and packages found
+    # in the directory watched by a FileFinder, including namespace
+    # packages.  Within a single directory, precedence follows the real
+    # import machinery: a regular package (a directory containing an
+    # ``__init__`` file) wins over a module of the same name, which in
+    # turn wins over a namespace package portion.
+    yielded = set()
+    namespace_packages = []
+    try:
+        filenames = sorted(os.listdir(importer.path))
+    except OSError:  # pragma: nocover
+        filenames = []
+    for filename in filenames:
+        modname = getmodulename(filename)
+        if modname == "__init__" or modname in yielded:
+            continue
+        if modname is None:
+            # not a recognized module file name; a directory without an
+            # ``__init__`` file is a namespace package portion
+            if (
+                filename != "__pycache__"
+                and filename.isidentifier()
+                and os.path.isdir(os.path.join(importer.path, filename))
+            ):
+                if _has_init_file(os.path.join(importer.path, filename)):
+                    ispkg = True
+                    modname = filename
+                else:
+                    # defer namespace packages: a regular package or a
+                    # module of the same name found later wins
+                    namespace_packages.append(filename)
+                    continue
+            else:
+                continue
+        else:
+            ispkg = False
+        if "." not in modname:
+            yielded.add(modname)
+            yield importer, prefix + modname, ispkg
+    for modname in namespace_packages:
+        if modname not in yielded:
+            yielded.add(modname)
+            yield importer, prefix + modname, True
+
+
+def _has_init_file(path):
+    try:
+        dircontents = os.listdir(path)
+    except OSError:  # pragma: nocover
+        return False
+    for filename in dircontents:
+        if getmodulename(filename) == "__init__":
+            return True
+    return False
 
 
 class lift(object):
