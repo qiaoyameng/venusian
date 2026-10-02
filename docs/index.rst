@@ -542,6 +542,59 @@ Packages and modules matched by any ignore in the list will not be imported,
 and their top-level code will not be run as a result.
 
 
+``static_members`` Scan Argument
+--------------------------------
+
+.. versionadded:: 3.2.0
+
+By default, ``scan`` enumerates the members of each module with
+:func:`inspect.getmembers` and looks up Venusian attachments with
+:func:`getattr`.  This means that scanning can trigger dynamic attribute
+machinery in the scanned code: module-level ``__getattr__`` hooks (PEP
+562), metaclass ``__getattr__`` hooks, and arbitrary descriptors are all
+invoked while objects are being enumerated.  Passing
+``static_members=True`` to :meth:`venusian.Scanner.scan` switches member
+enumeration into a "static" mode which avoids touching any of that
+machinery:
+
+.. code-block:: python
+   :linenos:
+
+   import venusian
+   scanner = venusian.Scanner()
+   scanner.scan(theapp, static_members=True)
+
+In static mode, members of each scanned module are collected from the
+module's real namespace (its ``__dict__``), and Venusian attachments are
+discovered from actual namespaces and controlled MRO information instead
+of via :func:`getattr`.  This has a few consequences:
+
+- Only real bindings are considered.  Attributes that are generated
+  dynamically, for example by a module ``__getattr__``, are not visible
+  to a static scan.
+
+- Classes found in a module namespace have their members enumerated
+  statically: the MRO is walked and class dictionaries are merged with
+  the first definition of a name winning, mirroring Python's static
+  attribute lookup rules for same-name overrides.  ``staticmethod`` and
+  ``classmethod`` objects are unwrapped to their underlying function.
+
+- ``__wrapped__`` links are followed only through real namespaces (never
+  through arbitrary attribute access), and cyclic wrapping chains
+  terminate instead of looping forever.  This allows attachments made to
+  a function hidden behind a wrapper to be found.
+
+- Attachments made directly to methods (rather than during class body
+  execution) can be found, and existing ``lift`` / ``onlyliftedfrom``
+  metadata is honored exactly as in the default mode.
+
+Note that static member enumeration does *not* make imports static:
+modules and packages are still imported during the scan, and their
+top-level code still executes.  Only the enumeration of members and the
+lookup of Venusian attachments avoid dynamic attribute access.  The
+default (``static_members=False``) keeps the historical behavior.
+
+
 Limitations and Audience
 ------------------------
 

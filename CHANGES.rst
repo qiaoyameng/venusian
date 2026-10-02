@@ -1,6 +1,17 @@
 3.2.0 (unreleased)
 ------------------
 
+- Add a ``static_members`` argument to ``venusian.Scanner.scan``.  When
+  true, module members are enumerated from the module's real namespace
+  and Venusian attachments are discovered from actual namespaces and
+  controlled MRO information, without triggering module ``__getattr__``
+  hooks, metaclass ``__getattr__`` hooks, or arbitrary descriptors.
+  ``staticmethod``/``classmethod`` members are unwrapped statically,
+  ``__wrapped__`` chains are followed safely (cycles terminate), and
+  ``lift``/``onlyliftedfrom`` metadata is honored.  Modules are still
+  imported (and their top-level code still executes) during a static
+  scan; the default scan mode is unchanged.
+
 - Remove support for Python 3.7 and 3.8.
 
 3.1.1 (2024-12-01)

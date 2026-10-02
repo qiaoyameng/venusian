@@ -936,6 +936,162 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[1]["ob"], subclassing.Super)
 
 
+class TestStaticMembers(unittest.TestCase):
+    def _makeOne(self, **kw):
+        from venusian import Scanner
+
+        return Scanner(**kw)
+
+    def _scan(self, module, **kw):
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        scanner.scan(module, **kw)
+        return test.registrations
+
+    def _normalize(self, registrations):
+        normalized = []
+        for reg in registrations:
+            items = tuple(
+                (key, id(value) if key == "ob" else value)
+                for key, value in sorted(reg.items())
+            )
+            normalized.append(items)
+        return sorted(normalized)
+
+    def test_static_finds_attachments_without_touching_dynamic_attrs(self):
+        from tests.fixtures import staticmode
+
+        del staticmode.dynamic_accesses[:]
+        del staticmode.descriptor_accesses[:]
+        registrations = self._scan(staticmode, static_members=True)
+        self.assertEqual(
+            sorted(reg["name"] for reg in registrations),
+            ["Class", "Class", "function"],
+        )
+        # the module __getattr__ advertising dynamic attributes through
+        # __dir__ was never triggered
+        self.assertEqual(staticmode.dynamic_accesses, [])
+        # neither the raising descriptor nor the metaclass __getattr__
+        # were touched
+        self.assertEqual(staticmode.descriptor_accesses, [])
+
+    def test_default_mode_triggers_dynamic_attributes(self):
+        from tests.fixtures import staticmode
+
+        del staticmode.dynamic_accesses[:]
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        # getmembers() resolves the names advertised by __dir__ through
+        # the module __getattr__, which raises here
+        self.assertRaises(RuntimeError, scanner.scan, staticmode)
+        self.assertTrue(staticmode.dynamic_accesses)
+
+    def test_static_matches_default_scan(self):
+        from tests.fixtures import category
+        from tests.fixtures import class_and_method
+        from tests.fixtures import inheritance
+        from tests.fixtures import lifting1
+        from tests.fixtures import lifting4
+        from tests.fixtures import lifting5
+        from tests.fixtures import one
+        from tests.fixtures import subclassing
+
+        modules = (
+            one,
+            category,
+            class_and_method,
+            inheritance,
+            lifting1,
+            lifting4,
+            lifting5,
+            subclassing,
+        )
+        for module in modules:
+            default = self._scan(module)
+            static = self._scan(module, static_members=True)
+            self.assertEqual(
+                self._normalize(static),
+                self._normalize(default),
+                "static scan of %r differs" % module.__name__,
+            )
+
+    def test_static_inheritance_and_override(self):
+        from tests.fixtures import staticinherit
+
+        registrations = self._scan(staticinherit, static_members=True)
+        by_name = {}
+        for reg in registrations:
+            by_name.setdefault(reg["name"], reg)
+        # callback sets before and after inheritance: Super fires its
+        # three member attachments; Sub inherits sm/cm (already fired for
+        # Super) and statically overrides method with an unattached
+        # function, so nothing fires for Sub
+        self.assertEqual(
+            sorted(by_name),
+            [
+                "Super.cm",
+                "Super.method",
+                "Super.sm",
+                "class_function",
+                "static_function",
+                "super_method",
+            ],
+        )
+        # staticmethod/classmethod members are unwrapped to the
+        # underlying function without invoking the descriptor protocol
+        self.assertTrue(by_name["Super.sm"]["ob"] is staticinherit.static_function)
+        self.assertTrue(by_name["Super.cm"]["ob"] is staticinherit.class_function)
+        self.assertTrue(by_name["Super.method"]["ob"] is staticinherit.super_method)
+
+    def test_static_wrapped_chains_and_cycles(self):
+        from tests.fixtures import staticwrapped
+
+        registrations = self._scan(staticwrapped, static_members=True)
+        by_name = {}
+        for reg in registrations:
+            by_name.setdefault(reg["name"], []).append(reg)
+        # the attachment on inner is found on inner itself and by
+        # statically following wrapper.__wrapped__
+        self.assertTrue(by_name["inner"][0]["ob"] is staticwrapped.inner)
+        self.assertTrue(by_name["wrapper"][0]["ob"] is staticwrapped.inner)
+        # cyclic and self-cyclic __wrapped__ chains terminate and carry
+        # no attachments
+        self.assertNotIn("cycle_a", by_name)
+        self.assertNotIn("cycle_b", by_name)
+        self.assertNotIn("self_cycle", by_name)
+        # functools.wraps copies the categories object into the wrapper
+        # namespace; the copy does not fire for the wrapper itself, but
+        # the original attachment is found through __wrapped__
+        self.assertTrue(by_name["wraps_wrapper"][0]["ob"] is staticwrapped.wrapped_orig)
+        self.assertTrue(by_name["WrapsHolder.m"][0]["ob"] is staticwrapped.wrapped_orig)
+        # the same categories do not fire again for the second member
+        self.assertNotIn("WrapsHolder.n", by_name)
+
+    def test_default_scan_does_not_follow_wrapped(self):
+        from tests.fixtures import staticwrapped
+
+        registrations = self._scan(staticwrapped)
+        self.assertEqual(
+            sorted(reg["name"] for reg in registrations),
+            ["inner", "wrapped_orig"],
+        )
+
+    def test_static_ignore_matches_class_members(self):
+        from tests.fixtures import staticinherit
+
+        registrations = self._scan(
+            staticinherit,
+            static_members=True,
+            ignore=["tests.fixtures.staticinherit.Super"],
+        )
+        names = [reg["name"] for reg in registrations]
+        self.assertNotIn("Super.method", names)
+        self.assertNotIn("Super.sm", names)
+        self.assertNotIn("Super.cm", names)
+        # module-level bindings of the same functions are not ignored
+        self.assertIn("super_method", names)
+
+
 class Test_lift(unittest.TestCase):
     def _makeOne(self, categories=None):
         from venusian import lift

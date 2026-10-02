@@ -9,11 +9,118 @@ ATTACH_ATTR = "__venusian_callbacks__"
 LIFTONLY_ATTR = "__venusian_liftonly_callbacks__"
 
 
+def _own_namespace(ob):
+    """Return the object's own namespace (its ``__dict__``) without
+    triggering any dynamic attribute machinery such as ``__getattr__``,
+    ``__getattribute__`` overrides, or descriptors.  Returns ``None``
+    when the object has no own namespace."""
+    try:
+        return object.__getattribute__(ob, "__dict__")
+    except Exception:
+        return None
+
+
+def _static_mro(cls):
+    """Return the MRO of ``cls`` without going through any metaclass
+    ``__getattribute__`` hook."""
+    try:
+        return object.__getattribute__(cls, "__mro__")
+    except Exception:  # pragma: nocover
+        return (cls,)
+
+
+def _static_unwrap_chain(ob):
+    """Yield ``ob`` and each object it statically wraps.
+
+    ``staticmethod`` and ``classmethod`` objects are unwrapped via their
+    ``__func__`` (this is what the descriptor protocol would do when the
+    member is accessed on a class).  ``__wrapped__`` links are followed
+    only when they are present in the object's *own* namespace; arbitrary
+    attribute access on the chain is never performed.  Cycles in the
+    wrapping chain terminate the iteration instead of looping forever.
+    """
+    seen = set()
+    current = ob
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        if isinstance(current, (staticmethod, classmethod)):
+            try:
+                current = current.__func__
+            except Exception:  # pragma: nocover
+                current = None
+        else:
+            namespace = _own_namespace(current)
+            if namespace is None:
+                current = None
+            else:
+                current = namespace.get("__wrapped__")
+
+
+def _static_attached_categories(ob):
+    """Statically look up Venusian attach categories on ``ob``.
+
+    This mirrors what ``getattr(ob, ATTACH_ATTR)`` would find, but only
+    consults real namespaces: for a class, the MRO is walked and the
+    first class dictionary containing the attribute wins (Python's
+    static lookup rule for same-name overrides); for any other object,
+    only its own namespace is consulted.  Metaclass hooks, instance
+    ``__getattr__`` and descriptors are never triggered.  Returns
+    ``None`` when no categories are found.
+    """
+    if isclass(ob):
+        # Inherited categories are found through the MRO exactly like
+        # ``getattr`` would find them; the ``attached_to`` check performed
+        # by the caller rejects categories that belong to a superclass,
+        # just as it does in the default (dynamic) scan mode.  Categories
+        # stored by ``onlyliftedfrom`` under LIFTONLY_ATTR are deliberately
+        # not returned here: they must not fire for the class itself.
+        for klass in _static_mro(ob):
+            namespace = _own_namespace(klass)
+            if namespace is not None and ATTACH_ATTR in namespace:
+                return namespace[ATTACH_ATTR]
+        return None
+    namespace = _own_namespace(ob)
+    if namespace is None:
+        return None
+    return namespace.get(ATTACH_ATTR)
+
+
+def _static_class_members(cls):
+    """Statically enumerate the members of a class.
+
+    Members are collected from the class dictionaries of the MRO; the
+    first definition of a name wins, which mirrors Python's static
+    attribute lookup rules for same-name overrides.  Neither descriptors
+    nor ``__getattr__`` hooks are triggered, and attributes contributed
+    by the metaclass are not included.
+    """
+    members = []
+    seen = set()
+    for klass in _static_mro(cls):
+        namespace = _own_namespace(klass)
+        if namespace is None:  # pragma: nocover
+            continue
+        for name, member in namespace.items():
+            if name in seen:
+                continue
+            seen.add(name)
+            members.append((name, member))
+    return members
+
+
 class Scanner(object):
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
-    def scan(self, package, categories=None, onerror=None, ignore=None):
+    def scan(
+        self,
+        package,
+        categories=None,
+        onerror=None,
+        ignore=None,
+        static_members=False,
+    ):
         """Scan a Python package and any of its subpackages.  All
         top-level objects will be considered; those marked with
         venusian callback attributes related to ``category`` will be
@@ -100,6 +207,40 @@ class Scanner(object):
 
         .. versionadded:: 1.0a3
            the ``ignore`` argument
+
+        The ``static_members`` argument switches member enumeration into
+        a "static" mode.  When it is true, members of each scanned module
+        are collected from the module's real namespace (its ``__dict__``)
+        instead of via :func:`inspect.getmembers`, and Venusian
+        attachments are discovered from actual namespaces and controlled
+        MRO information rather than via :func:`getattr`.  This means the
+        scan will not trigger module-level ``__getattr__`` hooks (PEP
+        562), metaclass ``__getattr__`` hooks, or arbitrary descriptors
+        while enumerating objects.  As a consequence, attributes that are
+        generated dynamically (e.g. by a module ``__getattr__``) are not
+        visible to a static scan; only real bindings are considered.
+
+        In static mode, classes found in a module namespace additionally
+        have their members enumerated statically: the MRO is walked and
+        class dictionaries are merged with the first definition of a name
+        winning (Python's static lookup rule for same-name overrides).
+        ``staticmethod`` and ``classmethod`` objects are unwrapped to
+        their underlying function, and ``__wrapped__`` links are followed
+        only through real namespaces (never through arbitrary attribute
+        access) with cycles terminating the chain.  Attachments made
+        directly to methods (rather than during class body execution) can
+        be found this way; existing ``lift``/``onlyliftedfrom`` metadata
+        is honored exactly as in the default mode.
+
+        Note that static member enumeration does not make imports static:
+        modules and packages are still imported during the scan, and
+        their top-level code still executes.  Only the enumeration of
+        members and the lookup of Venusian attachments avoid dynamic
+        attribute access.  The default (``static_members=False``) keeps
+        the historical behavior.
+
+        .. versionadded:: 3.2.0
+           the ``static_members`` argument
         """
 
         pkg_name = package.__name__
@@ -133,11 +274,11 @@ class Scanner(object):
                     return True
             return False
 
-        def invoke(mod_name, name, ob):
+        def invoke(mod_name, name, ob, attached_categories=None):
             fullname = mod_name + "." + name
 
             if _ignore(fullname):
-                return
+                return False
 
             category_keys = categories
             try:
@@ -157,11 +298,12 @@ class Scanner(object):
                 # has been seen in the wild, from PyMongo).  Thus the
                 # catchall except: return here, which in any other case would
                 # be high treason.
-                attached_categories = getattr(ob, ATTACH_ATTR)
+                if attached_categories is None:
+                    attached_categories = getattr(ob, ATTACH_ATTR)
                 if not attached_categories.attached_to(mod_name, name, ob):
-                    return
+                    return False
             except:
-                return
+                return False
             if category_keys is None:
                 category_keys = list(attached_categories.keys())
                 try:
@@ -172,7 +314,7 @@ class Scanner(object):
                     # callback.
                     category_keys.sort()
                 except TypeError:  # pragma: no cover
-                    return
+                    return False
             for category in category_keys:
                 callbacks = attached_categories.get(category, [])
                 try:
@@ -186,12 +328,62 @@ class Scanner(object):
                         callback(self, name, ob)
                 except ValueError:  # pragma: nocover
                     continue
+            return True
 
-        for name, ob in getmembers(package):
+        if static_members:
+            # Categories objects already fired for class members, so that
+            # a member inherited through the MRO (or bound under several
+            # names) does not fire its callbacks more than once per scan.
+            fired_member_categories = set()
+            enumerated_classes = set()
+
+            def invoke_static(mod_name, name, ob):
+                if _ignore(mod_name + "." + name):
+                    return
+                for unwrapped in _static_unwrap_chain(ob):
+                    attached_categories = _static_attached_categories(unwrapped)
+                    if attached_categories is not None:
+                        invoke(mod_name, name, unwrapped, attached_categories)
+                    if isclass(unwrapped):
+                        if id(unwrapped) in enumerated_classes:
+                            continue
+                        enumerated_classes.add(id(unwrapped))
+                        invoke_static_members(mod_name, name, unwrapped)
+
+            def invoke_static_members(mod_name, class_name, cls):
+                for member_name, member in _static_class_members(cls):
+                    for unwrapped in _static_unwrap_chain(member):
+                        attached_categories = _static_attached_categories(unwrapped)
+                        if attached_categories is None:
+                            continue
+                        if id(attached_categories) in fired_member_categories:
+                            continue
+                        fullname = "%s.%s" % (class_name, member_name)
+                        if invoke(mod_name, fullname, unwrapped, attached_categories):
+                            fired_member_categories.add(id(attached_categories))
+
+            def members_of(module):
+                # Only real bindings of the module namespace are
+                # considered; attributes generated dynamically through a
+                # module __getattr__ are not enumerated.
+                namespace = _own_namespace(module)
+                if namespace is None:  # pragma: nocover
+                    return []
+                # snapshot: callbacks may mutate the module namespace
+                return list(namespace.items())
+        else:
+
+            def invoke_static(mod_name, name, ob):
+                invoke(mod_name, name, ob)
+
+            def members_of(module):
+                return getmembers(module)
+
+        for name, ob in members_of(package):
             # whether it's a module or a package, we need to scan its
             # members; walk_packages only iterates over submodules and
             # subpackages
-            invoke(pkg_name, name, ob)
+            invoke_static(pkg_name, name, ob)
 
         if hasattr(package, "__path__"):  # package, not module
             results = walk_packages(
@@ -225,8 +417,8 @@ class Scanner(object):
                                 raise
                         module = sys.modules.get(modname)
                         if module is not None:
-                            for name, ob in getmembers(module, None):
-                                invoke(modname, name, ob)
+                            for name, ob in members_of(module):
+                                invoke_static(modname, name, ob)
                     finally:
                         if hasattr(loader, "file") and hasattr(
                             loader.file, "close"
