@@ -958,6 +958,176 @@ class Test_onlyliftedfrom(unittest.TestCase):
         self.assertRaises(RuntimeError, inst, None)
 
 
+class TestAttachment(unittest.TestCase):
+    def _makeScanner(self, **kw):
+        from venusian import Scanner
+
+        return Scanner(**kw)
+
+    def _scan_member(self, ob, name, scanner):
+        # temporarily bind ``ob`` as a member of this module so a scan
+        # of the module finds it
+        module = sys.modules[__name__]
+        setattr(module, name, ob)
+        try:
+            scanner.scan(module)
+        finally:
+            delattr(module, name)
+
+    def test_detach_one_of_two_identical_attaches(self):
+        import venusian
+
+        calls = []
+
+        def callback(scanner, name, ob):
+            calls.append(name)
+
+        def wrapped():  # pragma: no cover
+            pass
+
+        info1 = venusian.attach(wrapped, callback, depth=0)
+        info2 = venusian.attach(wrapped, callback, depth=0)
+        self.assertIsNot(info1.attachment, info2.attachment)
+
+        self.assertTrue(info1.attachment.detach())
+        scanner = self._makeScanner()
+        self._scan_member(wrapped, "wrapped", scanner)
+        self.assertEqual(len(calls), 1)
+
+        # detaching the same handle again is a no-op
+        self.assertFalse(info1.attachment.detach())
+        # the second attachment of the same callback is unaffected
+        self.assertTrue(info2.attachment.detach())
+        self._scan_member(wrapped, "wrapped", scanner)
+        self.assertEqual(len(calls), 1)
+
+    def test_detach_class_scope_attachment(self):
+        import venusian
+
+        calls = []
+
+        def callback(scanner, name, ob):
+            calls.append(ob)
+
+        def decorator(wrapped):
+            decorator.info = venusian.attach(wrapped, callback)
+            return wrapped
+
+        class Plugin(object):
+            @decorator
+            def method(self):  # pragma: no cover
+                pass
+
+        scanner = self._makeScanner()
+        self._scan_member(Plugin, "Plugin", scanner)
+        self.assertEqual(calls, [Plugin])
+
+        self.assertTrue(decorator.info.attachment.detach())
+        self._scan_member(Plugin, "Plugin", scanner)
+        self.assertEqual(len(calls), 1)
+
+    def test_detach_does_not_remove_lifted_copies(self):
+        import venusian
+
+        calls = []
+
+        def callback(scanner, name, ob):
+            calls.append(ob)
+
+        def decorator(wrapped):
+            decorator.info = venusian.attach(wrapped, callback)
+            return wrapped
+
+        class Super(object):
+            @decorator
+            def method(self):  # pragma: no cover
+                pass
+
+        @venusian.lift()
+        class Sub(Super):
+            pass
+
+        self.assertTrue(decorator.info.attachment.detach())
+
+        scanner = self._makeScanner()
+        self._scan_member(Super, "Super", scanner)
+        self._scan_member(Sub, "Sub", scanner)
+        # the lifted copy on Sub is an independent attachment: it
+        # survives the detaching of the original attachment on Super
+        self.assertEqual(calls, [Sub])
+
+    def test_handle_does_not_keep_wrapped_object_alive(self):
+        import gc
+        import weakref
+
+        import venusian
+
+        handles = []
+
+        def callback(scanner, name, ob):  # pragma: no cover
+            pass
+
+        def decorator(wrapped):
+            info = venusian.attach(wrapped, callback)
+            handles.append(info.attachment)
+            return wrapped
+
+        def make():
+            class Plugin(object):
+                @decorator
+                def method(self):  # pragma: no cover
+                    pass
+
+            return weakref.ref(Plugin)
+
+        ref = make()
+        gc.collect()
+        self.assertIs(ref(), None)
+        # the registry is gone with the class, so detaching is a no-op
+        self.assertFalse(handles[0].detach())
+
+    def test_detach_after_wrapped_function_collected(self):
+        import gc
+        import weakref
+
+        import venusian
+
+        def callback(scanner, name, ob):  # pragma: no cover
+            pass
+
+        def make():
+            def plugin():  # pragma: no cover
+                pass
+
+            info = venusian.attach(plugin, callback, depth=0)
+            return weakref.ref(plugin), info.attachment
+
+        ref, handle = make()
+        gc.collect()
+        self.assertIs(ref(), None)
+        self.assertFalse(handle.detach())
+
+    def test_attachinfo_backward_compatible(self):
+        import venusian
+
+        def callback(scanner, name, ob):  # pragma: no cover
+            pass
+
+        def wrapped():  # pragma: no cover
+            pass
+
+        info = venusian.attach(
+            wrapped, callback, category="mycategory", depth=0
+        )
+        self.assertEqual(info.scope, "function call")
+        self.assertEqual(info.module, sys.modules[__name__])
+        self.assertEqual(info.category, "mycategory")
+        self.assertTrue(isinstance(info.locals, dict))
+        self.assertTrue(isinstance(info.globals, dict))
+        self.assertEqual(len(info.codeinfo), 4)
+        self.assertIsInstance(info.attachment, venusian.Attachment)
+
+
 def md(name):  # pragma: no cover
     if name in sys.modules:
         del sys.modules[name]

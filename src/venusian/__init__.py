@@ -1,4 +1,5 @@
 import sys
+import weakref
 from inspect import getmembers, getmro, isclass
 from pkgutil import iter_modules
 
@@ -270,10 +271,73 @@ class AttachInfo(object):
       ``('/home/chrism/projects/venusian/tests/test_advice.py', 81,
       'testCallInfo', 'add_handler(foo, bar)')``
 
+    ``attachment``
+
+      An instance of :class:`venusian.Attachment`; a handle which can be
+      used to undo exactly this one attachment via its ``detach``
+      method.
+
     """
 
     def __init__(self, **kw):
         self.__dict__.update(kw)
+
+
+class Attachment(object):
+    """
+    A handle representing a single attachment of a callback to an
+    object.  An instance of this class is available as the
+    ``attachment`` attribute of the :class:`venusian.AttachInfo`
+    object returned by :func:`venusian.attach`.  Its :meth:`detach`
+    method undoes exactly that one attachment, which is useful when
+    callbacks need to be unregistered at runtime (for example when a
+    plugin is stopped).
+
+    Every call to :func:`venusian.attach` creates a new, distinct
+    attachment, even when the same callback is attached to the same
+    object more than once.  Detaching a handle removes only the
+    attachment it was created for; other attachments of an equal (or
+    identical) callback are left in place, because attachments are
+    matched by identity rather than by callback equality.
+
+    Callbacks which have been copied into subclasses by the
+    :class:`venusian.lift` class decorator are independent
+    attachments: detaching the handle of the original attachment does
+    *not* remove copies which were already lifted into subclasses, and
+    lifted copies do not have handles of their own.
+
+    The handle references the callback registry of the decorated
+    object only weakly, so keeping a handle alive does not prevent the
+    decorated object (for example a class) from being garbage
+    collected.  If the decorated object has already been garbage
+    collected, :meth:`detach` is a no-op which returns ``False``.
+    """
+
+    def __init__(self, categories, category, entry):
+        self._categories_ref = weakref.ref(categories)
+        self._category = category
+        self._entry = entry
+
+    def detach(self):
+        """Remove exactly the attachment this handle was created for.
+
+        Return ``True`` if the attachment was found and removed,
+        ``False`` if it had already been removed or if the decorated
+        object no longer exists.
+        """
+        categories = self._categories_ref()
+        if categories is None:
+            return False
+        callbacks = categories.get(self._category)
+        if not callbacks:
+            return False
+        for position, entry in enumerate(callbacks):
+            if entry is self._entry:
+                del callbacks[position]
+                if not callbacks:
+                    del categories[self._category]
+                return True
+        return False
 
 
 class Categories(dict):
@@ -302,6 +366,10 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
     ``name`` should be ``None`` or a string representing a subcategory within
     the category.  This will be used by the ``lift`` class decorator to
     determine if decorations of a method should be inherited or overridden.
+
+    The ``attachment`` attribute of the returned
+    :class:`venusian.AttachInfo` object is a :class:`venusian.Attachment`
+    handle which can be used to undo exactly this attachment later.
     """
 
     frame = sys._getframe(depth + 1)
@@ -332,7 +400,8 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
             setattr(wrapped, ATTACH_ATTR, categories)
         callbacks = categories.setdefault(category, [])
 
-    callbacks.append((callback, module_name, liftid, scope))
+    entry = (callback, module_name, liftid, scope)
+    callbacks.append(entry)
 
     return AttachInfo(
         scope=scope,
@@ -341,6 +410,7 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
         globals=f_globals,
         category=category,
         codeinfo=codeinfo,
+        attachment=Attachment(categories, category, entry),
     )
 
 

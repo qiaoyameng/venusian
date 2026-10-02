@@ -1,6 +1,16 @@
 3.2.0 (unreleased)
 ------------------
 
+- Add ``venusian.Attachment``, a handle exposed as the ``attachment``
+  attribute of the ``AttachInfo`` object returned by
+  ``venusian.attach``.  Calling its ``detach()`` method removes exactly
+  that one attachment (matched by identity, not by callback equality),
+  which allows callbacks to be unregistered at runtime, e.g. when a
+  plugin is stopped.  Copies of a callback lifted into subclasses by
+  ``venusian.lift`` are independent attachments and are not removed by
+  detaching the original.  The handle references the callback registry
+  only weakly, so it does not keep the decorated object alive.
+
 - Remove support for Python 3.7 and 3.8.
 
 3.1.1 (2024-12-01)
