@@ -2,6 +2,7 @@ import contextlib
 import os
 import re
 import sys
+import tempfile
 import unittest
 
 
@@ -934,6 +935,245 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[1]["attr"], "classname")
         self.assertEqual(test.registrations[1]["name"], "Super")
         self.assertEqual(test.registrations[1]["ob"], subclassing.Super)
+
+    def _make_fresh_module(self, name, source):
+        """Import a module written to a private temporary directory.
+
+        Using a real source file (instead of ``exec``) lets
+        ``venusian.attach`` recognise the module scope correctly.
+        """
+        import importlib
+        import shutil
+
+        tmpdir = tempfile.mkdtemp()
+        with open(os.path.join(tmpdir, name + ".py"), "w") as f:
+            f.write(source)
+        sys.path.insert(0, tmpdir)
+
+        def cleanup():
+            sys.modules.pop(name, None)
+            sys.path.remove(tmpdir)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        self.addCleanup(cleanup)
+        return importlib.import_module(name)
+
+    _COLLECT_SOURCE = (
+        "import venusian\n"
+        "class register(object):\n"
+        "    def __init__(self, marker):\n"
+        "        self.marker = marker\n"
+        "    def __call__(self, wrapped):\n"
+        "        marker = self.marker\n"
+        "        def callback(scanner, name, ob):\n"
+        "            scanner.marks.append(marker)\n"
+        "        venusian.attach(wrapped, callback)\n"
+        "        return wrapped\n"
+        "@register('first')\n"
+        "def registered_function():\n"
+        "    pass\n"
+    )
+
+    def test_collect_does_not_invoke_callbacks(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(one)
+        self.assertEqual(test.registrations, [])
+        self.assertGreater(len(plan), 0)
+
+    def test_collect_then_execute_matches_scan(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(one)
+        scanner.execute(plan)
+
+        test2 = _Test()
+        scanner2 = self._makeOne(test=test2)
+        scanned_plan = scanner2.scan(one)
+
+        self.assertEqual(len(plan), len(test.registrations))
+        self.assertEqual(len(plan), len(scanned_plan))
+        self.assertEqual(
+            [e.fullname for e in plan], [e.fullname for e in scanned_plan]
+        )
+        self.assertEqual(test.registrations, test2.registrations)
+
+    def test_collect_uses_categories(self):
+        from tests.fixtures import category
+
+        scanner = self._makeOne()
+        plan = scanner.collect(category, categories=("mycategory",))
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0].name, "function")
+        self.assertEqual(plan[0].category, "mycategory")
+        self.assertEqual(plan[0].cb_mod_name, category.__name__)
+        self.assertEqual(plan[0].ob, category.function)
+        self.assertIn(category.__name__ + ".function", repr(plan[0]))
+
+    def test_collect_respects_ignore(self):
+        from tests.fixtures import one
+
+        scanner = self._makeOne()
+        plan = scanner.collect(
+            one, ignore=[re.compile("module2$").search]
+        )
+        fullnames = [e.fullname for e in plan]
+        self.assertTrue(fullnames)
+        self.assertTrue(
+            all("module2" not in fullname for fullname in fullnames), fullnames
+        )
+
+    def test_collect_still_imports_modules(self):
+        marker = os.path.join(tempfile.mkdtemp(), "imported.marker")
+        import shutil
+
+        self.addCleanup(shutil.rmtree, os.path.dirname(marker), True)
+        source = (
+            "import os\n"
+            "import venusian\n"
+            "class noop(object):\n"
+            "    def __call__(self, wrapped):\n"
+            "        venusian.attach(wrapped, lambda s, n, o: None)\n"
+            "        return wrapped\n"
+            "open(%r, 'w').close()\n"
+            "@noop()\n"
+            "def imported_function():\n"
+            "    pass\n"
+        )
+        source = source % marker
+        module = self._make_fresh_module(
+            "venusian_collect_import_sideeffect", source
+        )
+        scanner = self._makeOne()
+        plan = scanner.collect(module)
+        self.assertTrue(os.path.exists(marker))
+        self.assertEqual(len(plan), 1)
+
+    def test_later_attach_does_not_change_collected_plan(self):
+        name = "venusian_collect_late_attach_test"
+        module = self._make_fresh_module(name, self._COLLECT_SOURCE)
+
+        scanner = self._makeOne(marks=[])
+        plan = scanner.collect(module)
+        self.assertEqual(len(plan), 1)
+
+        # emulate more decoration of an additional object within the
+        # scanned module (the callback's source module must be the scanned
+        # module itself, as with normal decorator usage)
+        late_source = (
+            "def late_function():\n"
+            "    pass\n"
+            "late_function = register('late')(late_function)\n"
+        )
+        exec(compile(late_source, "<late:%s>" % name, "exec"), module.__dict__)
+
+        scanner.execute(plan)
+        self.assertEqual(scanner.marks, ["first"])
+
+        rescanned = scanner.collect(module)
+        self.assertEqual(len(rescanned), 2)
+        scanner.execute(rescanned)
+        self.assertEqual(sorted(scanner.marks), ["first", "first", "late"])
+
+    def test_execute_uses_snapshotted_binding_and_skips_stale_object(self):
+        from venusian import StaleCallbackError
+
+        name = "venusian_collect_stale_object_test"
+        module = self._make_fresh_module(name, self._COLLECT_SOURCE)
+        original = module.registered_function
+
+        scanner = self._makeOne(marks=[])
+        plan = scanner.collect(module)
+
+        def replacement():
+            pass
+
+        module.registered_function = replacement
+
+        # default: stale entries are skipped
+        scanner.execute(plan)
+        self.assertEqual(scanner.marks, [])
+
+        # explicit skip policy behaves the same way
+        scanner.execute(plan, onstale="skip")
+        self.assertEqual(scanner.marks, [])
+
+        # raise policy surfaces the stale binding
+        with self.assertRaises(StaleCallbackError) as cm:
+            scanner.execute(plan, onstale="raise")
+        self.assertIs(cm.exception.entry, plan[0])
+        self.assertIn("replaced", cm.exception.reason)
+
+        # a callable policy may force execution with the snapshot anyway
+        scanner.execute(plan, onstale=lambda entry, reason: False)
+        self.assertEqual(scanner.marks, ["first"])
+
+        # restoring the original binding makes the entry current again
+        module.registered_function = original
+        scanner.execute(plan)
+        self.assertEqual(scanner.marks, ["first", "first"])
+
+    def test_execute_skips_entry_when_module_removed(self):
+        from venusian import StaleCallbackError
+
+        name = "venusian_collect_missing_module_test"
+        module = self._make_fresh_module(name, self._COLLECT_SOURCE)
+
+        scanner = self._makeOne(marks=[])
+        plan = scanner.collect(module)
+        del sys.modules[name]
+
+        scanner.execute(plan)
+        self.assertEqual(scanner.marks, [])
+
+        stale_entries = []
+
+        def record(entry, reason):
+            stale_entries.append((entry, reason))
+            return True
+
+        scanner.execute(plan, onstale=record)
+        self.assertEqual(len(stale_entries), 1)
+        self.assertIs(stale_entries[0][0], plan[0])
+        self.assertIn("removed", stale_entries[0][1])
+        with self.assertRaises(StaleCallbackError):
+            scanner.execute(plan, onstale="raise")
+
+    def test_execute_rejects_bad_onstale(self):
+        from tests.fixtures import one
+
+        scanner = self._makeOne(test=_Test())
+        plan = scanner.collect(one)
+        self.assertRaises(ValueError, scanner.execute, plan, "bogus")
+
+    def test_scan_returns_executed_plan(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.scan(one)
+        self.assertEqual(len(plan), len(test.registrations))
+        self.assertEqual(
+            [e.fullname for e in plan],
+            sorted(
+                "%s.%s" % (kw["ob"].__module__, kw["name"])
+                for kw in test.registrations
+            ),
+        )
+
+    def test_collect_lift_matches_scan(self):
+        from tests.fixtures import lifting1
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        plan = scanner.collect(lifting1)
+        scanner.execute(plan)
+        self.assertEqual(len(plan), 11)
+        self.assertEqual(len(test.registrations), 11)
 
 
 class Test_lift(unittest.TestCase):

@@ -7,6 +7,18 @@ API Documentation for Venusian
 
      .. automethod:: scan
 
+     .. automethod:: collect
+
+     .. automethod:: execute
+
+  .. autoclass:: ScanPlan
+
+     .. automethod:: execute
+
+  .. autoclass:: PlannedCallback
+
+  .. autoexception:: StaleCallbackError
+
   .. autoclass:: AttachInfo
 
   .. autofunction:: attach(wrapped, callback, category=None, name=None)

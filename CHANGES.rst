@@ -1,6 +1,18 @@
 3.2.0 (unreleased)
 ------------------
 
+- Add :meth:`venusian.Scanner.collect` and
+  :meth:`venusian.Scanner.execute`, which split a scan into an optional
+  two-step process: ``collect`` walks and imports the package and returns an
+  immutable :class:`venusian.ScanPlan` of the callbacks that would run
+  (without invoking any), while ``execute`` runs a previously collected plan.
+  ``scan`` continues to perform both steps at once and now returns the plan
+  it executed.  Collection snapshots the callback bindings, so later
+  ``attach`` calls never alter an existing plan; stale bindings encountered
+  while executing a plan are skipped by default (use ``onstale="raise"`` or
+  a callable to change this).  Collecting still imports modules, so
+  import-time side effects are not avoided.
+
 - Remove support for Python 3.7 and 3.8.
 
 3.1.1 (2024-12-01)

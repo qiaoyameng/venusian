@@ -1,4 +1,5 @@
 import sys
+from collections import namedtuple
 from inspect import getmembers, getmro, isclass
 from pkgutil import iter_modules
 
@@ -7,6 +8,169 @@ from venusian.compat import compat_find_loader
 
 ATTACH_ATTR = "__venusian_callbacks__"
 LIFTONLY_ATTR = "__venusian_liftonly_callbacks__"
+
+
+class PlannedCallback(
+    namedtuple(
+        "PlannedCallback",
+        [
+            "mod_name",
+            "name",
+            "ob",
+            "category",
+            "callback",
+            "cb_mod_name",
+            "liftid",
+            "scope",
+        ],
+    )
+):
+    """A single callback invocation found during a scan.
+
+    Instances are produced by :meth:`Scanner.collect`; the callback itself is
+    not called until :meth:`ScanPlan.execute` is run.
+
+    Attributes:
+
+    ``mod_name``
+      The dotted name of the module in which the decorated object was found
+      during the scan.
+
+    ``name``
+      The name of the decorated object within its module.
+
+    ``ob``
+      The decorated object (class, function, instance, ...) as it was when the
+      plan was collected.
+
+    ``category``
+      The Venusian category under which the callback was attached (usually a
+      string or ``None``).
+
+    ``callback``
+      The callable that will be invoked as ``callback(scanner, name, ob)``.
+
+    ``cb_mod_name``
+      The dotted name of the module in which the callback was attached.  It
+      must equal ``mod_name``; callbacks merely imported into another module
+      are not collected.
+
+    ``liftid``
+      The identifier used by the :class:`lift` class decorator to detect
+      overridden methods.
+
+    ``scope``
+      The scope (``exec``, ``module``, ``class``, ``function call`` or
+      ``unknown``) detected when the callback was attached.
+    """
+
+    @property
+    def fullname(self):
+        """The full dotted name of the decorated object."""
+        return self.mod_name + "." + self.name
+
+    def __repr__(self):
+        return (
+            "PlannedCallback(%r category=%r scope=%r callback=%r)"
+            % (self.fullname, self.category, self.scope, self.callback)
+        )
+
+
+class ScanPlan(object):
+    """The immutable result of :meth:`Scanner.collect`.
+
+    A plan records, in execution order, every callback that a matching
+    :meth:`Scanner.scan` would invoke, together with the object and name it
+    would be invoked with.  Collecting a plan never invokes any callbacks, but
+    the packages and modules visited by the scan are still imported, so
+    importing them may have import-time side effects.
+
+    The plan is a snapshot: attaching new callbacks after it was collected
+    does not change an existing plan.  Re-run :meth:`Scanner.collect` to pick
+    up later attachments.
+
+    Plans are iterable, indexable and sized::
+
+        plan = scanner.collect(package)
+        len(plan)
+        for entry in plan:
+            print(entry.fullname, entry.category)
+    """
+
+    #: Stale entries are silently skipped (the default).
+    SKIP = "skip"
+    #: Execution raises :class:`StaleCallbackError` at the first stale entry.
+    RAISE = "raise"
+
+    def __init__(self, entries=None, categories=None):
+        self._entries = list(entries or [])
+        self.categories = categories
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __len__(self):
+        return len(self._entries)
+
+    def __getitem__(self, index):
+        return self._entries[index]
+
+    def execute(self, scanner, onstale="skip"):
+        """Invoke the callbacks recorded in this plan.
+
+        ``scanner`` is the :class:`Scanner` passed to each callback as its
+        first argument.
+
+        ``onstale`` decides what happens when an entry refers to a module or
+        object that no longer matches the snapshot taken at collection time:
+
+        - ``"skip"`` (the default) silently skips the stale entry.
+        - ``"raise"`` raises a :class:`StaleCallbackError`.
+        - A callable is invoked as ``onstale(entry, reason)``; if it returns a
+          true value the entry is skipped, otherwise the snapshotted binding
+          is executed anyway.
+
+        An entry is considered stale when its module has been removed from
+        :data:`sys.modules`, the module no longer contains an object with the
+        recorded name, or that object is not the same object that was
+        collected.
+        """
+        if onstale not in (self.SKIP, self.RAISE) and not callable(onstale):
+            raise ValueError(
+                "onstale must be 'skip', 'raise' or a callable, got %r"
+                % (onstale,)
+            )
+        for entry in self._entries:
+            reason = self._stale_reason(entry)
+            if reason is not None:
+                if onstale == self.RAISE:
+                    raise StaleCallbackError(entry, reason)
+                if onstale == self.SKIP or onstale(entry, reason):
+                    continue
+            entry.callback(scanner, entry.name, entry.ob)
+
+    @staticmethod
+    def _stale_reason(entry):
+        module = sys.modules.get(entry.mod_name)
+        if module is None:
+            return "module removed from sys.modules"
+        module_ns = vars(module)
+        if entry.name not in module_ns:
+            return "object no longer present in module"
+        if module_ns[entry.name] is not entry.ob:
+            return "module attribute was replaced"
+        return None
+
+
+class StaleCallbackError(Exception):
+    """Raised when executing a plan entry whose binding is stale."""
+
+    def __init__(self, entry, reason):
+        self.entry = entry
+        self.reason = reason
+        super(StaleCallbackError, self).__init__(
+            "%s: %s" % (reason, entry.fullname)
+        )
 
 
 class Scanner(object):
@@ -18,6 +182,19 @@ class Scanner(object):
         top-level objects will be considered; those marked with
         venusian callback attributes related to ``category`` will be
         processed.
+
+        This is equivalent to collecting a plan with :meth:`collect` and
+        executing it straight away, with one difference in error behavior:
+        ``scan`` invokes each callback as soon as it is discovered, while
+        :meth:`collect` followed by :meth:`execute` first imports every
+        module and only then runs the callbacks.  Consequently a custom
+        ``onerror`` that swallows an import failure lets callbacks found
+        earlier still run during ``scan``; with a separate
+        collect/execute, callbacks only run once collection finished
+        successfully (apart from the errors handled by ``onerror``).
+
+        The :class:`ScanPlan` returned here records exactly the callbacks
+        that were executed, in order.
 
         The ``package`` argument should be a reference to a Python
         package or module object.
@@ -101,9 +278,61 @@ class Scanner(object):
         .. versionadded:: 1.0a3
            the ``ignore`` argument
         """
+        plan = ScanPlan(categories=categories)
+        _ignore = self._make_ignore(package.__name__, ignore)
 
-        pkg_name = package.__name__
+        def invoke(mod_name, name, ob):
+            for entry in self._iter_callbacks(categories, mod_name, name, ob):
+                if _ignore(entry.fullname):
+                    continue
+                entry.callback(self, name, ob)
+                plan._entries.append(entry)
 
+        self._walk(package, onerror, _ignore, invoke)
+        return plan
+
+    def collect(self, package, categories=None, onerror=None, ignore=None):
+        """Collect the callbacks a scan would run without running them.
+
+        Like :meth:`scan`, this walks ``package`` and its subpackages,
+        imports them and applies the same ``categories``, ``onerror`` and
+        ``ignore`` rules.  Importing modules may still execute their
+        top-level (import-time) code and therefore have side effects; what
+        this method does *not* do is call any attached Venusian callbacks.
+
+        It returns a :class:`ScanPlan` -- an ordered snapshot of the
+        callbacks that a scan at this point in time would invoke, each with
+        the module name, object name, object, category, callback source
+        module, lift id and scope recorded.  Attaching additional callbacks
+        after the plan was collected does not change it; call ``collect``
+        again to see them.
+        """
+        plan = ScanPlan(categories=categories)
+        _ignore = self._make_ignore(package.__name__, ignore)
+
+        def invoke(mod_name, name, ob):
+            for entry in self._iter_callbacks(categories, mod_name, name, ob):
+                if not _ignore(entry.fullname):
+                    plan._entries.append(entry)
+
+        self._walk(package, onerror, _ignore, invoke)
+        return plan
+
+    def execute(self, plan, onstale="skip"):
+        """Run the callbacks recorded in a :class:`ScanPlan`.
+
+        Callbacks run in the order recorded by :meth:`collect`, each invoked
+        as ``callback(self, entry.name, entry.ob)`` with the object binding
+        snapshotted at collection time.
+
+        ``onstale`` controls entries whose module or object has changed
+        since collection; see :meth:`ScanPlan.execute`.  Defaults to
+        ``"skip"``.
+        """
+        plan.execute(self, onstale=onstale)
+
+    @staticmethod
+    def _make_ignore(pkg_name, ignore):
         if ignore is not None and (
             isinstance(ignore, str) or not hasattr(ignore, "__iter__")
         ):
@@ -133,59 +362,76 @@ class Scanner(object):
                     return True
             return False
 
-        def invoke(mod_name, name, ob):
-            fullname = mod_name + "." + name
+        return _ignore
 
-            if _ignore(fullname):
+    @staticmethod
+    def _iter_callbacks(categories, mod_name, name, ob):
+        """Yield PlannedCallbacks attached to ``ob`` for ``categories``.
+
+        The callback tuples are snapshotted (copied) here, so callbacks
+        attached later -- directly or through ``lift`` -- never appear in a
+        plan that was already collected.
+        """
+        category_keys = categories
+        try:
+            # Some metaclasses do insane things when asked for an
+            # ``ATTACH_ATTR``, like not raising an AttributeError but
+            # some other arbitary exception.  Some even shittier
+            # introspected code lets us access ``ATTACH_ATTR`` far but
+            # barfs on a second attribute access for ``attached_to``
+            # (still not raising an AttributeError, but some other
+            # arbitrary exception).  Finally, the shittiest code of all
+            # allows the attribute access of the ``ATTACH_ATTR`` *and*
+            # ``attached_to``, (say, both ``ob.__getattr__`` and
+            # ``attached_categories.__getattr__`` returning a proxy for
+            # any attribute access), which either a) isn't callable or b)
+            # is callable, but, when called, shits its pants in an
+            # potentially arbitrary way (although for b, only TypeError
+            # has been seen in the wild, from PyMongo).  Thus the
+            # catchall except: return here, which in any other case would
+            # be high treason.
+            attached_categories = getattr(ob, ATTACH_ATTR)
+            if not attached_categories.attached_to(mod_name, name, ob):
                 return
-
-            category_keys = categories
+        except:
+            return
+        if category_keys is None:
+            category_keys = list(attached_categories.keys())
             try:
-                # Some metaclasses do insane things when asked for an
-                # ``ATTACH_ATTR``, like not raising an AttributeError but
-                # some other arbitary exception.  Some even shittier
-                # introspected code lets us access ``ATTACH_ATTR`` far but
-                # barfs on a second attribute access for ``attached_to``
-                # (still not raising an AttributeError, but some other
-                # arbitrary exception).  Finally, the shittiest code of all
-                # allows the attribute access of the ``ATTACH_ATTR`` *and*
-                # ``attached_to``, (say, both ``ob.__getattr__`` and
-                # ``attached_categories.__getattr__`` returning a proxy for
-                # any attribute access), which either a) isn't callable or b)
-                # is callable, but, when called, shits its pants in an
-                # potentially arbitrary way (although for b, only TypeError
-                # has been seen in the wild, from PyMongo).  Thus the
-                # catchall except: return here, which in any other case would
-                # be high treason.
-                attached_categories = getattr(ob, ATTACH_ATTR)
-                if not attached_categories.attached_to(mod_name, name, ob):
-                    return
-            except:
+                # When metaclasses return proxies for any attribute access
+                # the list may contain keys of different types which might
+                # not be sortable.  In that case we can just return,
+                # because we're not dealing with a proper venusian
+                # callback.
+                category_keys.sort()
+            except TypeError:  # pragma: no cover
                 return
-            if category_keys is None:
-                category_keys = list(attached_categories.keys())
-                try:
-                    # When metaclasses return proxies for any attribute access
-                    # the list may contain keys of different types which might
-                    # not be sortable.  In that case we can just return,
-                    # because we're not dealing with a proper venusian
-                    # callback.
-                    category_keys.sort()
-                except TypeError:  # pragma: no cover
-                    return
-            for category in category_keys:
-                callbacks = attached_categories.get(category, [])
-                try:
-                    # Metaclasses might trick us by reaching this far and then
-                    # fail with too little values to unpack.
-                    for callback, cb_mod_name, liftid, scope in callbacks:
-                        if cb_mod_name != mod_name:
-                            # avoid processing objects that were imported into
-                            # this module but were not actually defined there
-                            continue
-                        callback(self, name, ob)
-                except ValueError:  # pragma: nocover
-                    continue
+        for category in category_keys:
+            callbacks = attached_categories.get(category, [])
+            try:
+                # Metaclasses might trick us by reaching this far and then
+                # fail with too little values to unpack.
+                for callback, cb_mod_name, liftid, scope in list(callbacks):
+                    if cb_mod_name != mod_name:
+                        # avoid processing objects that were imported into
+                        # this module but were not actually defined there
+                        continue
+                    yield PlannedCallback(
+                        mod_name=mod_name,
+                        name=name,
+                        ob=ob,
+                        category=category,
+                        callback=callback,
+                        cb_mod_name=cb_mod_name,
+                        liftid=liftid,
+                        scope=scope,
+                    )
+            except ValueError:  # pragma: nocover
+                continue
+
+    @staticmethod
+    def _walk(package, onerror, _ignore, invoke):
+        pkg_name = package.__name__
 
         for name, ob in getmembers(package):
             # whether it's a module or a package, we need to scan its
