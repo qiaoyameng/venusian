@@ -3,6 +3,18 @@
 
 - Remove support for Python 3.7 and 3.8.
 
+- Add a ``static`` mode to ``Scanner.scan``.  When ``static=True`` the
+  scanner discovers members from real module and class namespaces and the
+  controlled MRO rather than generic attribute access, so a module-level
+  ``__getattr__`` (PEP 562) and raising class/metaclass descriptors are never
+  triggered just to enumerate objects.  Genuine bindings, dynamically
+  generated attributes and inherited members are distinguished,
+  ``staticmethod``/``classmethod`` wrappers are unwrapped and existing
+  ``lift`` metadata is honored.  The ``__wrapped__`` chain is read only from
+  each object's own namespace and cycles terminate.  Importing the package
+  and its submodules still executes module code, as in the default mode; the
+  default (``static=False``) behavior is unchanged.
+
 3.1.1 (2024-12-01)
 ------------------
 

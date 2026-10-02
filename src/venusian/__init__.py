@@ -9,11 +9,112 @@ ATTACH_ATTR = "__venusian_callbacks__"
 LIFTONLY_ATTR = "__venusian_liftonly_callbacks__"
 
 
+def _raw_namespace(ob):
+    """Return the *real* namespace mapping of ``ob`` without invoking any
+    descriptor protocol, ``__getattr__`` hook or other user code.
+
+    For modules this is the module ``__dict__`` in which imports and module
+    globals live; for classes it is the ``mappingproxy`` of the class body.
+    Both expose a dictionary-like ``.get``.  Returns ``None`` when the object
+    has no usable namespace (for example a built-in object).
+    """
+    try:
+        return object.__getattribute__(ob, "__dict__")
+    except AttributeError:
+        return None
+
+
+def _unwrap_descriptor(ob):
+    """Unwrap a bare ``staticmethod``/``classmethod`` object.
+
+    Only exact descriptor types are unwrapped.  A subclass may have overridden
+    ``__func__`` to be an arbitrary descriptor, so retrieving it through the
+    normal attribute protocol could execute user code; the subclass instance
+    is therefore returned untouched.
+    """
+    if type(ob) is staticmethod or type(ob) is classmethod:
+        try:
+            return object.__getattribute__(ob, "__func__")
+        except AttributeError:  # pragma: no cover
+            return ob
+    return ob
+
+
+def _static_attached_categories(ob):
+    """Discover Venusian categories attached to ``ob`` using only static
+    namespace inspection.
+
+    No attribute of ``ob`` is read through the normal attribute protocol, so
+    neither data descriptors (including hostile metaclass descriptors) nor a
+    module-level ``__getattr__`` (see :pep:`562`) are ever invoked.
+
+    Only bindings that genuinely exist in the object's own namespace are
+    considered: inherited ``__venusian_callbacks__`` mappings are deliberately
+    ignored, matching the ordinary scan, which only processes attachments
+    whose identity matches the resolved object.  Attachments placed on a
+    function later wrapped by :func:`functools.wraps`-style decorators are
+    still found by walking the ``__wrapped__`` chain, but the chain is read
+    strictly from each hop's own namespace and loops terminate.
+
+    Returns a ``(categories, resolved)`` tuple, or ``(None, ob)`` when no
+    attachment was found.
+    """
+    ob = _unwrap_descriptor(ob)
+
+    # Classes already carry the merged categories of their method-level
+    # decorations in their own namespace (see ``attach`` and ``lift``);
+    # walking __wrapped__ on a class would risk following a data descriptor
+    # defined on the metaclass.
+    if isclass(ob):
+        namespace = _raw_namespace(ob)
+        if namespace is not None:
+            categories = namespace.get(ATTACH_ATTR, None)
+            if categories is not None:
+                return categories, ob
+        return None, ob
+
+    seen = set()
+    current = ob
+    while id(current) not in seen:
+        seen.add(id(current))
+        namespace = _raw_namespace(current)
+        if namespace is None:
+            break
+        categories = namespace.get(ATTACH_ATTR, None)
+        if categories is not None:
+            return categories, current
+        # Read __wrapped__ only from this hop's own namespace.  A descriptor
+        # inherited from the type (or supplied by __getattr__) is never
+        # invoked.
+        current = namespace.get("__wrapped__", None)
+        if current is None:
+            break
+    return None, ob
+
+
+def _static_namespace_members(module):
+    """Yield ``(name, value)`` pairs from a module's real namespace.
+
+    This replaces :func:`inspect.getmembers` for static scans: it never calls
+    ``dir()`` nor performs attribute access, so module ``__getattr__`` hooks
+    and descriptors stored as module globals are never triggered.
+    """
+    namespace = _raw_namespace(module)
+    if namespace is None:
+        return
+    try:
+        items = list(namespace.items())
+    except Exception:  # pragma: no cover - pathological module dict
+        return
+    for name, value in items:
+        yield name, value
+
+
 class Scanner(object):
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
-    def scan(self, package, categories=None, onerror=None, ignore=None):
+    def scan(self, package, categories=None, onerror=None, ignore=None, static=False):
         """Scan a Python package and any of its subpackages.  All
         top-level objects will be considered; those marked with
         venusian callback attributes related to ``category`` will be
@@ -97,6 +198,29 @@ class Scanner(object):
 
         A string or callable alone can also be passed as ``ignore`` without a
         surrounding list.
+
+        When ``static`` is true (it defaults to ``False`` for backwards
+        compatibility), members are discovered *statically*: Venusian reads
+        the real namespace dictionaries of modules and classes and the
+        controlled method-resolution order instead of performing generic
+        attribute access.  Consequently a module-level ``__getattr__`` (see
+        :pep:`562`), data descriptors stored as module globals and hostile
+        metaclass descriptors are never triggered just to enumerate objects.
+        Genuine bindings, dynamically generated attributes and inherited
+        members are distinguished the same way Python's own static lookup
+        would: only attachments actually present on the resolved object's own
+        namespace (or on a function reachable through a non-cyclic
+        ``__wrapped__`` chain) are processed.  ``staticmethod`` and
+        ``classmethod`` wrappers are unwrapped, and ``lift`` metadata already
+        merged into a subclass is honored.
+
+        Static scanning changes *how members are enumerated*, not how the
+        package is loaded: submodules and packages are still imported so that
+        their module code executes and their decorators run.  Objects of
+        modules that are never imported cannot be discovered in either mode.
+
+        .. versionadded:: 3.2.0
+           the ``static`` argument
 
         .. versionadded:: 1.0a3
            the ``ignore`` argument
@@ -187,16 +311,72 @@ class Scanner(object):
                 except ValueError:  # pragma: nocover
                     continue
 
-        for name, ob in getmembers(package):
+        def static_invoke(mod_name, name, ob):
+            fullname = mod_name + "." + name
+
+            if _ignore(fullname):
+                return
+
+            attached_categories, resolved = _static_attached_categories(ob)
+            if attached_categories is None:
+                return
+            try:
+                if not attached_categories.attached_to(
+                    mod_name, name, resolved
+                ):
+                    return
+            except Exception:
+                return
+
+            category_keys = categories
+            if category_keys is None:
+                category_keys = list(attached_categories.keys())
+                try:
+                    category_keys.sort()
+                except TypeError:  # pragma: no cover
+                    return
+            for category in category_keys:
+                callbacks = attached_categories.get(category, [])
+                try:
+                    # As with the dynamic path, malformed callback tuples are
+                    # ignored.
+                    for callback, cb_mod_name, liftid, scope in callbacks:
+                        if cb_mod_name != mod_name:
+                            # avoid processing objects that were imported into
+                            # this module but were not actually defined there
+                            continue
+                        callback(self, name, resolved)
+                except ValueError:  # pragma: nocover
+                    continue
+
+        if static:
+            invoke_members = _static_namespace_members
+            invoke = static_invoke
+        else:
+            def invoke_members(namespace):
+                return getmembers(namespace, None)
+
+        for name, ob in invoke_members(package):
             # whether it's a module or a package, we need to scan its
             # members; walk_packages only iterates over submodules and
             # subpackages
             invoke(pkg_name, name, ob)
 
-        if hasattr(package, "__path__"):  # package, not module
+        package_namespace = _raw_namespace(package)
+        package_path = (
+            package_namespace.get("__path__", None)
+            if package_namespace is not None
+            else None
+        )
+        if static:
+            is_package = package_path is not None
+        else:
+            is_package = hasattr(package, "__path__")  # package, not module
+
+        if is_package:
             results = walk_packages(
-                package.__path__,
-                package.__name__ + ".",
+                package_path if static else package.__path__,
+                pkg_name + ".",
                 onerror=onerror,
                 ignore=_ignore,
             )
@@ -225,7 +405,7 @@ class Scanner(object):
                                 raise
                         module = sys.modules.get(modname)
                         if module is not None:
-                            for name, ob in getmembers(module, None):
+                            for name, ob in invoke_members(module):
                                 invoke(modname, name, ob)
                     finally:
                         if hasattr(loader, "file") and hasattr(
