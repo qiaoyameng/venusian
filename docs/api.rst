@@ -9,6 +9,14 @@ API Documentation for Venusian
 
   .. autoclass:: AttachInfo
 
+  .. autoclass:: ScanDiagnostics
+
+     .. automethod:: explain
+
+  .. autoclass:: ScanRecord
+
+     .. automethod:: explain
+
   .. autofunction:: attach(wrapped, callback, category=None, name=None)
 
   .. autoclass:: lift

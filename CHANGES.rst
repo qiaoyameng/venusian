@@ -1,6 +1,13 @@
 3.2.0 (unreleased)
 ------------------
 
+- Add a ``diagnostics`` argument to ``venusian.Scanner.scan``.  When a
+  ``venusian.ScanDiagnostics`` instance is passed, the scan records why each
+  candidate object was selected or excluded (ignored, category mismatch,
+  attached to a different object, re-exported from another module, or
+  failed with an error), including lifted and inherited callbacks.  The
+  number of records can be bounded with a limit; truncation is marked.
+
 - Remove support for Python 3.7 and 3.8.
 
 3.1.1 (2024-12-01)

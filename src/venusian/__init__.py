@@ -13,7 +13,14 @@ class Scanner(object):
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
-    def scan(self, package, categories=None, onerror=None, ignore=None):
+    def scan(
+        self,
+        package,
+        categories=None,
+        onerror=None,
+        ignore=None,
+        diagnostics=None,
+    ):
         """Scan a Python package and any of its subpackages.  All
         top-level objects will be considered; those marked with
         venusian callback attributes related to ``category`` will be
@@ -100,9 +107,31 @@ class Scanner(object):
 
         .. versionadded:: 1.0a3
            the ``ignore`` argument
+
+        The ``diagnostics`` argument should be ``None`` (the default) or an
+        instance of :class:`venusian.ScanDiagnostics`.  When an instance is
+        passed, the scan records why each candidate object it encounters was
+        either selected (its callback invoked) or excluded (ignored, filtered
+        out by category, attached to a different object, defined in another
+        module, or failed with an error).  Diagnostics only observe the
+        normal scan process: no extra attribute descriptors are triggered and
+        no module is imported more than it would be during a normal scan.
+        After the scan, inspect ``diagnostics.records`` (a list of
+        :class:`venusian.ScanRecord` objects) or call
+        ``diagnostics.explain()`` for a human-readable report.  The number of
+        records kept can be bounded via the ``limit`` argument of
+        :class:`venusian.ScanDiagnostics`; when the limit is reached,
+        ``diagnostics.truncated`` is set to ``True``.
+
+        .. versionadded:: 3.2
+           the ``diagnostics`` argument
         """
 
         pkg_name = package.__name__
+
+        def _record(**kw):
+            if diagnostics is not None:
+                diagnostics.record(ScanRecord(**kw))
 
         if ignore is not None and (
             isinstance(ignore, str) or not hasattr(ignore, "__iter__")
@@ -137,30 +166,76 @@ class Scanner(object):
             fullname = mod_name + "." + name
 
             if _ignore(fullname):
+                _record(
+                    module=mod_name,
+                    name=name,
+                    category=None,
+                    outcome="skipped",
+                    reason="ignored",
+                    detail="%r matched an ignore rule" % fullname,
+                )
                 return
 
             category_keys = categories
+            # Some metaclasses do insane things when asked for an
+            # ``ATTACH_ATTR``, like not raising an AttributeError but
+            # some other arbitary exception.  Some even shittier
+            # introspected code lets us access ``ATTACH_ATTR`` far but
+            # barfs on a second attribute access for ``attached_to``
+            # (still not raising an AttributeError, but some other
+            # arbitrary exception).  Finally, the shittiest code of all
+            # allows the attribute access of the ``ATTACH_ATTR`` *and*
+            # ``attached_to``, (say, both ``ob.__getattr__`` and
+            # ``attached_categories.__getattr__`` returning a proxy for
+            # any attribute access), which either a) isn't callable or b)
+            # is callable, but, when called, shits its pants in an
+            # potentially arbitrary way (although for b, only TypeError
+            # has been seen in the wild, from PyMongo).  Thus the
+            # catchall except: return here, which in any other case would
+            # be high treason.
             try:
-                # Some metaclasses do insane things when asked for an
-                # ``ATTACH_ATTR``, like not raising an AttributeError but
-                # some other arbitary exception.  Some even shittier
-                # introspected code lets us access ``ATTACH_ATTR`` far but
-                # barfs on a second attribute access for ``attached_to``
-                # (still not raising an AttributeError, but some other
-                # arbitrary exception).  Finally, the shittiest code of all
-                # allows the attribute access of the ``ATTACH_ATTR`` *and*
-                # ``attached_to``, (say, both ``ob.__getattr__`` and
-                # ``attached_categories.__getattr__`` returning a proxy for
-                # any attribute access), which either a) isn't callable or b)
-                # is callable, but, when called, shits its pants in an
-                # potentially arbitrary way (although for b, only TypeError
-                # has been seen in the wild, from PyMongo).  Thus the
-                # catchall except: return here, which in any other case would
-                # be high treason.
                 attached_categories = getattr(ob, ATTACH_ATTR)
-                if not attached_categories.attached_to(mod_name, name, ob):
-                    return
-            except:
+            except AttributeError:
+                # no venusian callbacks attached; not a candidate, so no
+                # diagnostics record is emitted for this object
+                return
+            except BaseException:
+                _record(
+                    module=mod_name,
+                    name=name,
+                    category=None,
+                    outcome="skipped",
+                    reason="introspection-error",
+                    detail="accessing %r on the object raised an "
+                    "exception" % ATTACH_ATTR,
+                )
+                return
+            try:
+                matched = attached_categories.attached_to(mod_name, name, ob)
+            except BaseException:
+                _record(
+                    module=mod_name,
+                    name=name,
+                    category=None,
+                    outcome="skipped",
+                    reason="introspection-error",
+                    detail="checking whether the object is the attachment "
+                    "target raised an exception",
+                )
+                return
+            if not matched:
+                _record(
+                    module=mod_name,
+                    name=name,
+                    category=None,
+                    outcome="skipped",
+                    reason="attached-elsewhere",
+                    detail="venusian callbacks found on the object are "
+                    "attached to %r, not to %r (the callbacks were "
+                    "inherited from a superclass or the object was "
+                    "re-exported under another name)"
+                    % (attached_categories.attached_id, fullname),
+                )
                 return
             if category_keys is None:
                 category_keys = list(attached_categories.keys())
@@ -173,6 +248,19 @@ class Scanner(object):
                     category_keys.sort()
                 except TypeError:  # pragma: no cover
                     return
+            else:
+                for missed in attached_categories:
+                    if missed not in category_keys:
+                        _record(
+                            module=mod_name,
+                            name=name,
+                            category=missed,
+                            outcome="skipped",
+                            reason="category-mismatch",
+                            detail="category %r was not among the "
+                            "categories requested for this scan" % (missed,),
+                        )
+            lifted = getattr(attached_categories, "lifted", False)
             for category in category_keys:
                 callbacks = attached_categories.get(category, [])
                 try:
@@ -182,8 +270,44 @@ class Scanner(object):
                         if cb_mod_name != mod_name:
                             # avoid processing objects that were imported into
                             # this module but were not actually defined there
+                            _record(
+                                module=mod_name,
+                                name=name,
+                                category=category,
+                                outcome="skipped",
+                                reason="foreign-callback",
+                                defined_in=cb_mod_name,
+                                lifted=lifted,
+                                detail="callback was defined in module %r; "
+                                "the object was merely re-exported by %r"
+                                % (cb_mod_name, mod_name),
+                            )
                             continue
-                        callback(self, name, ob)
+                        try:
+                            callback(self, name, ob)
+                        except BaseException as exc:
+                            _record(
+                                module=mod_name,
+                                name=name,
+                                category=category,
+                                outcome="error",
+                                reason="callback-raised",
+                                defined_in=cb_mod_name,
+                                lifted=lifted,
+                                detail="callback raised %s: %s"
+                                % (type(exc).__name__, exc),
+                            )
+                            raise
+                        _record(
+                            module=mod_name,
+                            name=name,
+                            category=category,
+                            outcome="invoked",
+                            reason="invoked",
+                            defined_in=cb_mod_name,
+                            lifted=lifted,
+                            detail="callback was invoked",
+                        )
                 except ValueError:  # pragma: nocover
                     continue
 
@@ -194,11 +318,28 @@ class Scanner(object):
             invoke(pkg_name, name, ob)
 
         if hasattr(package, "__path__"):  # package, not module
+            walk_ignore = _ignore
+            if diagnostics is not None:
+
+                def walk_ignore(fullname):
+                    ignored = _ignore(fullname)
+                    if ignored:
+                        _record(
+                            module=fullname,
+                            name=None,
+                            category=None,
+                            outcome="skipped",
+                            reason="ignored",
+                            detail="module or package %r matched an ignore "
+                            "rule; it was not imported" % fullname,
+                        )
+                    return ignored
+
             results = walk_packages(
                 package.__path__,
                 package.__name__ + ".",
                 onerror=onerror,
-                ignore=_ignore,
+                ignore=walk_ignore,
             )
 
             for importer, modname, ispkg in results:
@@ -232,6 +373,155 @@ class Scanner(object):
                             loader.file, "close"
                         ):  # pragma: nocover
                             loader.file.close()
+
+
+class ScanRecord(object):
+    """
+    A single scan diagnostics record, describing the fate of one candidate
+    object (or module) encountered during a scan.  Instances are created by
+    :meth:`venusian.Scanner.scan` when a :class:`venusian.ScanDiagnostics`
+    instance is passed as its ``diagnostics`` argument.  It has the
+    following attributes:
+
+    ``module``
+
+      The full dotted name of the module in which the object was found.  For
+      records about a module or package itself (for example one excluded by
+      an ignore rule before import), this is the full dotted name of that
+      module or package.
+
+    ``name``
+
+      The attribute name of the object within ``module``, or ``None`` for
+      records about a module or package itself.
+
+    ``category``
+
+      The venusian callback category the record pertains to, or ``None`` if
+      the decision was made before any category was considered.
+
+    ``outcome``
+
+      One of ``invoked`` (a callback was invoked for the object),
+      ``skipped`` (the object was excluded from the scan), or ``error`` (a
+      callback was selected but raised an exception).  A callback that
+      raises is never reported as ``skipped``.
+
+    ``reason``
+
+      A short machine-readable string explaining the outcome.  One of
+      ``invoked``, ``ignored``, ``category-mismatch``, ``attached-elsewhere``
+      (the callbacks found on the object are attached to a different object,
+      e.g. inherited from a superclass), ``foreign-callback`` (the object
+      was defined in another module and merely re-exported here),
+      ``introspection-error``, or ``callback-raised``.
+
+    ``detail``
+
+      A human-readable sentence elaborating on ``reason``.
+
+    ``defined_in``
+
+      The full dotted name of the module in which the callback was defined,
+      or ``None`` if no callback was reached.
+
+    ``lifted``
+
+      ``True`` if the callbacks considered were placed on the object by the
+      :class:`venusian.lift` class decorator, ``False`` otherwise.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(
+        self,
+        module,
+        name,
+        category,
+        outcome,
+        reason,
+        detail=None,
+        defined_in=None,
+        lifted=False,
+    ):
+        self.module = module
+        self.name = name
+        self.category = category
+        self.outcome = outcome
+        self.reason = reason
+        self.detail = detail
+        self.defined_in = defined_in
+        self.lifted = lifted
+
+    @property
+    def fullname(self):
+        if self.name is None:
+            return self.module
+        return "%s.%s" % (self.module, self.name)
+
+    def explain(self):
+        line = "[%s] %s (%s)" % (self.outcome, self.fullname, self.reason)
+        extras = []
+        if self.category is not None:
+            extras.append("category=%r" % (self.category,))
+        if self.defined_in is not None and self.defined_in != self.module:
+            extras.append("defined in %s" % self.defined_in)
+        if self.lifted:
+            extras.append("lifted")
+        if extras:
+            line = "%s [%s]" % (line, ", ".join(extras))
+        if self.detail:
+            line = "%s: %s" % (line, self.detail)
+        return line
+
+    def __repr__(self):
+        return "<ScanRecord %s>" % self.explain()
+
+
+class ScanDiagnostics(object):
+    """
+    A collector for scan diagnostics.  Pass an instance of this class as
+    the ``diagnostics`` argument of :meth:`venusian.Scanner.scan` to record
+    why each candidate object encountered during the scan was selected or
+    excluded.  Diagnostics only observe the normal scan process: collecting
+    them does not trigger extra attribute descriptors on scanned objects and
+    does not cause any module to be imported that a normal scan would not
+    import.
+
+    ``limit`` should be ``None`` (the default) or an integer.  When it is an
+    integer, at most ``limit`` records are kept; once the limit is reached,
+    further records are dropped, ``truncated`` is set to ``True`` and the
+    number of dropped records is counted in ``dropped``.
+
+    After the scan, the ``records`` attribute holds the list of
+    :class:`venusian.ScanRecord` objects collected, in the order in which
+    the scan encountered them.  Call :meth:`explain` for a human-readable
+    report; a truncated report always ends with a truncation marker.
+
+    .. versionadded:: 3.2
+    """
+
+    def __init__(self, limit=None):
+        self.limit = limit
+        self.records = []
+        self.truncated = False
+        self.dropped = 0
+
+    def record(self, record):
+        if self.limit is not None and len(self.records) >= self.limit:
+            self.truncated = True
+            self.dropped += 1
+            return
+        self.records.append(record)
+
+    def explain(self):
+        lines = [record.explain() for record in self.records]
+        if self.truncated:
+            lines.append(
+                "... truncated: %d further record(s) dropped "
+                "(limit=%d)" % (self.dropped, self.limit)
+            )
+        return "\n".join(lines)
 
 
 class AttachInfo(object):

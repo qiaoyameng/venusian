@@ -936,6 +936,205 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[1]["ob"], subclassing.Super)
 
 
+class TestScanDiagnostics(unittest.TestCase):
+    def _makeOne(self, **kw):
+        from venusian import Scanner
+
+        return Scanner(**kw)
+
+    def _makeDiagnostics(self, **kw):
+        from venusian import ScanDiagnostics
+
+        return ScanDiagnostics(**kw)
+
+    def _records_for(self, diagnostics, name):
+        return [r for r in diagnostics.records if r.name == name]
+
+    def test_reexported_object_explained(self):
+        from tests.fixtures import two
+
+        test = _Test()
+        diagnostics = self._makeDiagnostics()
+        scanner = self._makeOne(test=test)
+        scanner.scan(two, diagnostics=diagnostics)
+        # the Class re-exported by tests.fixtures.two.mod2 is skipped
+        # because its callback was defined in tests.fixtures.two.mod1
+        skipped = [
+            r
+            for r in self._records_for(diagnostics, "Class")
+            if r.outcome == "skipped"
+        ]
+        self.assertEqual(len(skipped), 1)
+        record = skipped[0]
+        self.assertEqual(record.module, "tests.fixtures.two.mod2")
+        self.assertEqual(record.reason, "foreign-callback")
+        self.assertEqual(record.defined_in, "tests.fixtures.two.mod1")
+        # the original in mod1 was invoked
+        invoked = [
+            r
+            for r in self._records_for(diagnostics, "Class")
+            if r.outcome == "invoked"
+        ]
+        self.assertEqual(len(invoked), 1)
+        self.assertEqual(invoked[0].module, "tests.fixtures.two.mod1")
+        report = diagnostics.explain()
+        self.assertIn("foreign-callback", report)
+        self.assertIn("tests.fixtures.two.mod1", report)
+
+    def test_ignored_module_explained(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        diagnostics = self._makeDiagnostics()
+        scanner = self._makeOne(test=test)
+        scanner.scan(one, ignore=[".module2"], diagnostics=diagnostics)
+        module_records = [r for r in diagnostics.records if r.name is None]
+        self.assertEqual(len(module_records), 1)
+        record = module_records[0]
+        self.assertEqual(record.module, "tests.fixtures.one.module2")
+        self.assertEqual(record.outcome, "skipped")
+        self.assertEqual(record.reason, "ignored")
+        # no object from the ignored module was considered
+        self.assertEqual(
+            [
+                r
+                for r in diagnostics.records
+                if r.module == "tests.fixtures.one.module2" and r.name
+            ],
+            [],
+        )
+        report = diagnostics.explain()
+        self.assertIn("ignored", report)
+        self.assertIn("tests.fixtures.one.module2", report)
+
+    def test_inherited_callback_explained(self):
+        from tests.fixtures import subclassing
+
+        test = _Test()
+        diagnostics = self._makeDiagnostics()
+        scanner = self._makeOne(test=test)
+        scanner.scan(subclassing, diagnostics=diagnostics)
+        # Sub inherits Super's venusian callbacks; they are not attached
+        # to Sub itself, so Sub is skipped
+        sub_records = self._records_for(diagnostics, "Sub")
+        self.assertEqual(len(sub_records), 1)
+        record = sub_records[0]
+        self.assertEqual(record.outcome, "skipped")
+        self.assertEqual(record.reason, "attached-elsewhere")
+        self.assertIn("Super", record.detail)
+        # Super's own callbacks were invoked
+        super_records = self._records_for(diagnostics, "Super")
+        self.assertTrue(super_records)
+        self.assertTrue(all(r.outcome == "invoked" for r in super_records))
+        report = diagnostics.explain()
+        self.assertIn("attached-elsewhere", report)
+
+    def test_lifted_methods_recorded_as_lifted(self):
+        from tests.fixtures import lifting1
+
+        test = _Test()
+        diagnostics = self._makeDiagnostics()
+        scanner = self._makeOne(test=test)
+        scanner.scan(lifting1, diagnostics=diagnostics)
+        sub_records = [
+            r
+            for r in self._records_for(diagnostics, "Sub")
+            if r.outcome == "invoked"
+        ]
+        self.assertTrue(sub_records)
+        self.assertTrue(all(r.lifted for r in sub_records))
+        super_records = [
+            r
+            for r in self._records_for(diagnostics, "Super1")
+            if r.outcome == "invoked"
+        ]
+        self.assertTrue(super_records)
+        self.assertTrue(all(not r.lifted for r in super_records))
+
+    def test_category_mismatch_explained(self):
+        from tests.fixtures import category
+
+        test = _Test()
+        diagnostics = self._makeDiagnostics()
+        scanner = self._makeOne(test=test)
+        scanner.scan(category, categories=("mycategory",), diagnostics=diagnostics)
+        skipped = [
+            r
+            for r in self._records_for(diagnostics, "function2")
+            if r.outcome == "skipped"
+        ]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].reason, "category-mismatch")
+        self.assertEqual(skipped[0].category, "mycategory2")
+        invoked = [
+            r
+            for r in self._records_for(diagnostics, "function")
+            if r.outcome == "invoked"
+        ]
+        self.assertEqual(len(invoked), 1)
+
+    def test_callback_exception_not_conflated_with_skipped(self):
+        from tests.fixtures import raising
+
+        diagnostics = self._makeDiagnostics()
+        scanner = self._makeOne()
+        self.assertRaises(RuntimeError, scanner.scan, raising, diagnostics=diagnostics)
+        records = self._records_for(diagnostics, "function")
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.outcome, "error")
+        self.assertEqual(record.reason, "callback-raised")
+        self.assertIn("boom", record.detail)
+        self.assertNotEqual(record.outcome, "skipped")
+        report = diagnostics.explain()
+        self.assertIn("error", report)
+        self.assertIn("boom", report)
+
+    def test_limit_truncates_and_marks(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        diagnostics = self._makeDiagnostics(limit=1)
+        scanner = self._makeOne(test=test)
+        scanner.scan(one, diagnostics=diagnostics)
+        self.assertEqual(len(diagnostics.records), 1)
+        self.assertTrue(diagnostics.truncated)
+        self.assertTrue(diagnostics.dropped > 0)
+        report = diagnostics.explain()
+        self.assertIn("truncated", report)
+        # scanning still worked despite truncation
+        self.assertEqual(len(test.registrations), 6)
+
+    def test_no_diagnostics_by_default(self):
+        from tests.fixtures import one
+
+        test = _Test()
+        scanner = self._makeOne(test=test)
+        scanner.scan(one)
+        self.assertEqual(len(test.registrations), 6)
+
+    def test_record_repr_and_fullname(self):
+        from venusian import ScanRecord
+
+        record = ScanRecord(
+            module="m",
+            name="n",
+            category="c",
+            outcome="invoked",
+            reason="invoked",
+        )
+        self.assertEqual(record.fullname, "m.n")
+        self.assertIn("m.n", repr(record))
+        mod_record = ScanRecord(
+            module="m",
+            name=None,
+            category=None,
+            outcome="skipped",
+            reason="ignored",
+        )
+        self.assertEqual(mod_record.fullname, "m")
+
+
 class Test_lift(unittest.TestCase):
     def _makeOne(self, categories=None):
         from venusian import lift
