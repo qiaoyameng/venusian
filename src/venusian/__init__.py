@@ -1,4 +1,5 @@
 import sys
+import weakref
 from inspect import getmembers, getmro, isclass
 from pkgutil import iter_modules
 
@@ -7,13 +8,98 @@ from venusian.compat import compat_find_loader
 
 ATTACH_ATTR = "__venusian_callbacks__"
 LIFTONLY_ATTR = "__venusian_liftonly_callbacks__"
+SESSION_TOKENS_ATTR = "__venusian_session_tokens__"
+
+
+class ScanSession(object):
+    """Record attachments whose callbacks completed successfully.
+
+    A scanner using a session skips previously processed attachments when the
+    same package or module is scanned again.  Each session has independent
+    state; use :meth:`clear` to allow every attachment to be processed again.
+    """
+
+    def __init__(self):
+        self._attachments = set()
+        self._categories = weakref.WeakValueDictionary()
+        self._next_category_token = 0
+
+    def _category_token(self, attached_categories):
+        tokens = getattr(attached_categories, SESSION_TOKENS_ATTR, None)
+        if tokens is None:
+            tokens = {}
+            try:
+                setattr(attached_categories, SESSION_TOKENS_ATTR, tokens)
+            except (AttributeError, TypeError):
+                return None
+        session_id = id(self)
+        token = tokens.get(session_id)
+        if token is None:
+            token = self._next_category_token
+            self._next_category_token += 1
+            tokens[session_id] = token
+        return token
+
+    def attachment_seen(
+        self, attached_categories, ob, category, index, attachment_id
+    ):
+        categories_token = self._category_token(attached_categories)
+        ob_id = id(ob)
+        return (
+            categories_token is not None
+            and self._categories.get(categories_token) is attached_categories
+            and self._attachment_key(
+                categories_token, ob_id, category, index, attachment_id
+            )
+            in self._attachments
+        )
+
+    def record_attachment(
+        self, attached_categories, ob, category, index, attachment_id
+    ):
+        categories_token = self._category_token(attached_categories)
+        if categories_token is None:
+            return
+        ob_id = id(ob)
+        key = self._attachment_key(
+            categories_token, ob_id, category, index, attachment_id
+        )
+        if categories_token not in self._categories:
+            session = weakref.ref(self)
+
+            def discard():
+                current_session = session()
+                if current_session is not None:
+                    current_session._discard_categories(categories_token)
+
+            self._categories[categories_token] = attached_categories
+            weakref.finalize(attached_categories, discard)
+        self._attachments.add(key)
+
+    def clear(self):
+        """Forget every successfully processed attachment."""
+        self._attachments.clear()
+
+    def _attachment_key(
+        self, categories_token, ob_id, category, index, attachment_id
+    ):
+        return (categories_token, ob_id, category, index, attachment_id)
+
+    def _discard_categories(self, categories_token):
+        self._attachments = {
+            attachment
+            for attachment in self._attachments
+            if attachment[0] != categories_token
+        }
 
 
 class Scanner(object):
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
-    def scan(self, package, categories=None, onerror=None, ignore=None):
+    def scan(
+        self, package, categories=None, onerror=None, ignore=None, session=None
+    ):
         """Scan a Python package and any of its subpackages.  All
         top-level objects will be considered; those marked with
         venusian callback attributes related to ``category`` will be
@@ -100,7 +186,15 @@ class Scanner(object):
 
         .. versionadded:: 1.0a3
            the ``ignore`` argument
+
+        The ``session`` argument can be a :class:`ScanSession`.  When one is
+        supplied, callbacks that completed successfully during an earlier scan
+        using that session are skipped.  Attachments skipped because of
+        ``categories`` filtering or a callback failure are not recorded.  By
+        default (``None``), every scan processes all matching attachments.
         """
+        if session is None:
+            session = getattr(self, "session", None)
 
         pkg_name = package.__name__
 
@@ -178,12 +272,34 @@ class Scanner(object):
                 try:
                     # Metaclasses might trick us by reaching this far and then
                     # fail with too little values to unpack.
-                    for callback, cb_mod_name, liftid, scope in callbacks:
+                    enumerated_callbacks = enumerate(list(callbacks))
+                    for index, attachment in enumerated_callbacks:
+                        try:
+                            callback, cb_mod_name, liftid, scope = attachment
+                        except ValueError:  # pragma: nocover
+                            continue
                         if cb_mod_name != mod_name:
                             # avoid processing objects that were imported into
                             # this module but were not actually defined there
                             continue
+                        attachment_id = id(attachment)
+                        if session is not None and session.attachment_seen(
+                            attached_categories,
+                            ob,
+                            category,
+                            index,
+                            attachment_id,
+                        ):
+                            continue
                         callback(self, name, ob)
+                        if session is not None:
+                            session.record_attachment(
+                                attached_categories,
+                                ob,
+                                category,
+                                index,
+                                attachment_id,
+                            )
                 except ValueError:  # pragma: nocover
                     continue
 

@@ -1,8 +1,13 @@
 import contextlib
+import gc
+import importlib
 import os
 import re
 import sys
+import tempfile
 import unittest
+import uuid
+import weakref
 
 
 @contextlib.contextmanager
@@ -17,6 +22,21 @@ def zip_file_in_sys_path():
     """Context manager that puts zipped.zip at head of sys.path"""
     zip_pkg_path = os.path.join(os.path.dirname(__file__), "fixtures", "zipped.zip")
     return with_entry_in_sys_path(zip_pkg_path)
+
+
+@contextlib.contextmanager
+def temporary_module(source):
+    module_name = "_venusian_session_" + uuid.uuid4().hex
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, module_name + ".py")
+        with open(path, "w") as module_file:
+            module_file.write(source)
+        sys.path.insert(0, directory)
+        try:
+            yield importlib.import_module(module_name)
+        finally:
+            sys.path.remove(directory)
+            sys.modules.pop(module_name, None)
 
 
 class _Test(object):
@@ -223,6 +243,228 @@ class TestScanner(unittest.TestCase):
         self.assertEqual(test.registrations[1]["name"], "function2")
         self.assertEqual(test.registrations[1]["ob"], category.function2)
         self.assertEqual(test.registrations[1]["function"], True)
+
+    def test_session_skips_only_successfully_scanned_attachments(self):
+        import venusian
+
+        source = """
+import venusian
+
+def register_first(wrapped):
+    def callback(scanner, name, ob):
+        scanner.calls.append(('first', name))
+    venusian.attach(wrapped, callback)
+    return wrapped
+
+def register_second(wrapped):
+    def callback(scanner, name, ob):
+        scanner.calls.append(('second', name))
+        if scanner.should_fail:
+            raise RuntimeError('callback failed')
+    venusian.attach(wrapped, callback)
+    return wrapped
+
+@register_first
+def a_target():
+    pass
+
+@register_first
+def first_target():
+    pass
+
+@register_second
+def second_target():
+    pass
+"""
+        with temporary_module(source) as module:
+            session = venusian.ScanSession()
+            scanner = self._makeOne(calls=[], should_fail=True)
+            with self.assertRaises(RuntimeError):
+                scanner.scan(module, session=session)
+            self.assertEqual(
+                scanner.calls,
+                [
+                    ("first", "a_target"),
+                    ("first", "first_target"),
+                    ("second", "second_target"),
+                ],
+            )
+
+            scanner.calls[:] = []
+            with self.assertRaises(RuntimeError):
+                scanner.scan(module, session=session)
+            self.assertEqual(scanner.calls, [("second", "second_target")])
+
+            scanner.should_fail = False
+            scanner.calls[:] = []
+            scanner.scan(module, session=session)
+            self.assertEqual(scanner.calls, [("second", "second_target")])
+
+            scanner.calls[:] = []
+            scanner.scan(module, session=session)
+            self.assertEqual(scanner.calls, [])
+
+    def test_session_category_filtering_does_not_consume_attachments(self):
+        import venusian
+
+        source = """
+import venusian
+
+def register_one(wrapped):
+    def callback(scanner, name, ob):
+        scanner.calls.append(('one', name))
+    venusian.attach(wrapped, callback, category='one')
+    return wrapped
+
+def register_two(wrapped):
+    def callback(scanner, name, ob):
+        scanner.calls.append(('two', name))
+    venusian.attach(wrapped, callback, category='two')
+    return wrapped
+
+@register_one
+@register_two
+def target():
+    pass
+"""
+        with temporary_module(source) as module:
+            session = venusian.ScanSession()
+            scanner = self._makeOne(calls=[])
+            scanner.scan(module, categories=("one",), session=session)
+            self.assertEqual(scanner.calls, [("one", "target")])
+
+            scanner.scan(module, session=session)
+            self.assertEqual(
+                scanner.calls,
+                [("one", "target"), ("two", "target")],
+            )
+
+    def test_session_isolation_and_clear(self):
+        import venusian
+
+        source = """
+import venusian
+
+def register(wrapped):
+    def callback(scanner, name, ob):
+        scanner.calls.append(name)
+    venusian.attach(wrapped, callback)
+    return wrapped
+
+@register
+def target():
+    pass
+"""
+        with temporary_module(source) as module:
+            first_session = venusian.ScanSession()
+            second_session = venusian.ScanSession()
+            scanner = self._makeOne(calls=[])
+
+            scanner.scan(module, session=first_session)
+            scanner.scan(module, session=second_session)
+            self.assertEqual(scanner.calls, ["target", "target"])
+
+            scanner.scan(module, session=first_session)
+            scanner.scan(module, session=second_session)
+            self.assertEqual(scanner.calls, ["target", "target"])
+
+            first_session.clear()
+            scanner.scan(module, session=first_session)
+            scanner.scan(module, session=second_session)
+            self.assertEqual(scanner.calls, ["target", "target", "target"])
+
+    def test_session_can_be_provided_to_scanner(self):
+        import venusian
+
+        source = """
+import venusian
+
+def register(wrapped):
+    def callback(scanner, name, ob):
+        scanner.calls.append(name)
+    venusian.attach(wrapped, callback)
+    return wrapped
+
+@register
+def target():
+    pass
+"""
+        with temporary_module(source) as module:
+            session = venusian.ScanSession()
+            scanner = self._makeOne(calls=[], session=session)
+
+            scanner.scan(module)
+            scanner.scan(module)
+            self.assertEqual(scanner.calls, ["target"])
+
+    def test_session_consecutive_append_and_reload(self):
+        import venusian
+
+        source = """
+import venusian
+
+def register(wrapped):
+    def callback(scanner, name, ob):
+        scanner.calls.append((name, ob.label))
+    venusian.attach(wrapped, callback)
+    return wrapped
+
+@register
+def target():
+    pass
+
+target.label = 'first'
+
+def append_attachment():
+    @register
+    def added():
+        pass
+    added.label = 'added'
+    globals()['added'] = added
+"""
+        with temporary_module(source) as module:
+            session = venusian.ScanSession()
+            scanner = self._makeOne(calls=[])
+
+            scanner.scan(module, session=session)
+            scanner.scan(module, session=session)
+            self.assertEqual(
+                scanner.calls, [("target", "first")]
+            )
+
+            module.append_attachment()
+            scanner.scan(module, session=session)
+            scanner.scan(module, session=session)
+            self.assertEqual(
+                scanner.calls,
+                [("target", "first"), ("added", "added")],
+            )
+
+            old_target = weakref.ref(module.target)
+            old_added = weakref.ref(module.added)
+            with open(module.__file__, "a") as module_file:
+                module_file.write(
+                    "\ntarget.label = 'second'\n"
+                    "\nadded = None\n"
+                    "\ndef reloaded(): pass\n"
+                    "\nreloaded.label = 'reloaded'\n"
+                    "\nreloaded = register(reloaded)\n"
+                )
+            importlib.reload(module)
+            scanner.scan(module, session=session)
+            self.assertEqual(
+                scanner.calls,
+                [
+                    ("target", "first"),
+                    ("added", "added"),
+                    ("reloaded", "reloaded"),
+                    ("target", "second"),
+                ],
+            )
+
+            gc.collect()
+            self.assertIsNone(old_target())
+            self.assertIsNone(old_added())
 
     def test_decorations_arent_inherited(self):
         from tests.fixtures import inheritance

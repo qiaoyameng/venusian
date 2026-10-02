@@ -3,6 +3,10 @@
 
 - Remove support for Python 3.7 and 3.8.
 
+- Add ``ScanSession`` for incremental scans.  A scanner using a session skips
+  only attachments whose callbacks completed successfully in an earlier scan
+  using that same session.
+
 3.1.1 (2024-12-01)
 ------------------
 
