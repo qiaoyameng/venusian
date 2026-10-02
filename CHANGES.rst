@@ -3,6 +3,10 @@
 
 - Remove support for Python 3.7 and 3.8.
 
+- Add optional scanner diagnostics that report why attachments are selected,
+  filtered by category, ignored, inherited, re-exported from another module,
+  or fail while invoking a callback.
+
 3.1.1 (2024-12-01)
 ------------------
 

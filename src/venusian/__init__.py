@@ -8,12 +8,106 @@ from venusian.compat import compat_find_loader
 ATTACH_ATTR = "__venusian_callbacks__"
 LIFTONLY_ATTR = "__venusian_liftonly_callbacks__"
 
+DIAGNOSTIC_SELECTED = "selected"
+DIAGNOSTIC_EXCLUDED = "excluded"
+DIAGNOSTIC_IGNORED = "ignored"
+DIAGNOSTIC_ERROR = "error"
+
+REASON_CALLBACK_ERROR = "callback error"
+REASON_CATEGORY_FILTERED = "category filtered"
+REASON_INHERITED = "inherited attachment"
+REASON_INVALID_ATTACHMENT = "invalid attachment"
+REASON_INVALID_CATEGORIES = "invalid categories"
+REASON_MODULE_IGNORED = "module ignored"
+REASON_OBJECT_IGNORED = "object ignored"
+REASON_WRONG_MODULE = "defined in another module"
+
+
+class ScanEvent(object):
+    """Observed outcome for one callback attachment or ignored module.
+
+    ``module`` is where the object was found.  ``found_name`` is the name
+    used in that module, while ``source_module`` and ``source_name`` identify
+    where the callback was defined.  ``lifted_from`` is set when a callback
+    was copied onto a subclass by :class:`lift`.
+    """
+
+    def __init__(
+        self,
+        module=None,
+        name=None,
+        found_name=None,
+        category=None,
+        status=None,
+        reason=None,
+        found_module=None,
+        source_module=None,
+        source_name=None,
+        lifted_from=None,
+        scope=None,
+        error=None,
+    ):
+        self.module = module
+        self.name = name
+        self.found_name = found_name
+        self.category = category
+        self.status = status
+        self.reason = reason
+        self.found_module = found_module
+        self.source_module = source_module
+        self.source_name = source_name
+        self.lifted_from = lifted_from
+        self.scope = scope
+        self.error = error
+
+
+class ScanReport(object):
+    """Collect diagnostic events observed while scanning a package.
+
+    When ``limit`` is set, at most that many normal events are retained.
+    If the report is truncated, the final event is replaced by a marked
+    truncation event containing the number of omitted events.
+    """
+
+    def __init__(self, limit=None):
+        self.limit = limit
+        self.events = []
+        self.omitted = 0
+
+    def __call__(self, event):
+        if (
+            self.limit is not None
+            and self.limit >= 0
+            and len(self.events) >= self.limit
+        ):
+            self.omitted += 1
+            if self.events and self.events[-1].reason == "truncated":
+                self.events[-1].reason = "truncated (%d events omitted)" % self.omitted
+            else:
+                if self.events:
+                    self.events.pop()
+                self.events.append(
+                    ScanEvent(
+                        status=DIAGNOSTIC_EXCLUDED,
+                        reason="truncated (%d events omitted)" % self.omitted,
+                    )
+                )
+            return
+        self.events.append(event)
+
 
 class Scanner(object):
     def __init__(self, **kw):
         self.__dict__.update(kw)
 
-    def scan(self, package, categories=None, onerror=None, ignore=None):
+    def scan(
+        self,
+        package,
+        categories=None,
+        onerror=None,
+        ignore=None,
+        diagnostic=None,
+    ):
         """Scan a Python package and any of its subpackages.  All
         top-level objects will be considered; those marked with
         venusian callback attributes related to ``category`` will be
@@ -100,6 +194,11 @@ class Scanner(object):
 
         .. versionadded:: 1.0a3
            the ``ignore`` argument
+
+        The ``diagnostic`` argument may be a callable that receives a
+        :class:`ScanEvent` for attachments and modules observed during the
+        scan, or a :class:`ScanReport` instance.  Diagnostics never invoke
+        callbacks or import modules in addition to the normal scan.
         """
 
         pkg_name = package.__name__
@@ -110,6 +209,9 @@ class Scanner(object):
             ignore = [ignore]
         elif ignore is None:
             ignore = []
+        requested_categories = (
+            tuple(categories) if categories is not None else None
+        )
 
         # non-leading-dotted name absolute object name
         str_ignores = [ign for ign in ignore if isinstance(ign, str)]
@@ -120,26 +222,76 @@ class Scanner(object):
         # functions, e.g. re.compile('pattern').search
         callable_ignores = [ign for ign in ignore if callable(ign)]
 
-        def _ignore(fullname):
+        def _ignore_reason(fullname):
             for ign in rel_ignores:
                 if fullname.startswith(pkg_name + ign):
-                    return True
+                    return ign
             for ign in abs_ignores:
                 # non-leading-dotted name absolute object name
                 if fullname.startswith(ign):
-                    return True
+                    return ign
             for ign in callable_ignores:
                 if ign(fullname):
-                    return True
-            return False
+                    return ign
+
+        def record(
+            mod_name,
+            name=None,
+            found_name=None,
+            category=None,
+            status=DIAGNOSTIC_EXCLUDED,
+            reason=None,
+            source_module=None,
+            source_name=None,
+            lifted_from=None,
+            scope=None,
+            error=None,
+        ):
+            if diagnostic is None:
+                return
+            diagnostic(
+                ScanEvent(
+                    module=mod_name,
+                    name=name,
+                    found_name=found_name,
+                    category=category,
+                    status=status,
+                    reason=reason,
+                    found_module=mod_name,
+                    source_module=source_module,
+                    source_name=source_name,
+                    lifted_from=lifted_from,
+                    scope=scope,
+                    error=error,
+                )
+            )
+
+        def attachment_source(entry, fallback_name):
+            if len(entry) > 4:
+                return entry[4]
+            return {"name": fallback_name}
+
+        def report_ignored(mod_name, name):
+            fullname = mod_name + "." + name
+            reason = _ignore_reason(fullname)
+            if reason is None:
+                return False
+            record(
+                mod_name,
+                name,
+                found_name=name,
+                reason=REASON_OBJECT_IGNORED,
+                status=DIAGNOSTIC_IGNORED,
+            )
+            return True
 
         def invoke(mod_name, name, ob):
             fullname = mod_name + "." + name
+            effective_categories = requested_categories
 
-            if _ignore(fullname):
+            if report_ignored(mod_name, name):
                 return
 
-            category_keys = categories
             try:
                 # Some metaclasses do insane things when asked for an
                 # ``ATTACH_ATTR``, like not raising an AttributeError but
@@ -159,33 +311,142 @@ class Scanner(object):
                 # be high treason.
                 attached_categories = getattr(ob, ATTACH_ATTR)
                 if not attached_categories.attached_to(mod_name, name, ob):
+                    record(
+                        mod_name,
+                        name,
+                        found_name=name,
+                        reason=REASON_INHERITED,
+                    )
                     return
             except:
                 return
-            if category_keys is None:
-                category_keys = list(attached_categories.keys())
+            if effective_categories is None:
                 try:
-                    # When metaclasses return proxies for any attribute access
-                    # the list may contain keys of different types which might
-                    # not be sortable.  In that case we can just return,
-                    # because we're not dealing with a proper venusian
-                    # callback.
-                    category_keys.sort()
+                    effective_categories = sorted(attached_categories.keys())
                 except TypeError:  # pragma: no cover
+                    record(
+                        mod_name,
+                        name,
+                        found_name=name,
+                        reason=REASON_INVALID_CATEGORIES,
+                        status=DIAGNOSTIC_ERROR,
+                        error=sys.exc_info()[1],
+                    )
                     return
-            for category in category_keys:
-                callbacks = attached_categories.get(category, [])
+            elif diagnostic is not None:
+                available_categories = attached_categories.keys()
+                effective_categories = tuple(
+                    category
+                    for category in effective_categories
+                    if category in available_categories
+                ) + tuple(
+                    category
+                    for category in sorted(available_categories)
+                    if category not in requested_categories
+                )
+            for category in effective_categories:
+                callbacks = attached_categories.get(category)
+                if callbacks is None:
+                    continue
                 try:
                     # Metaclasses might trick us by reaching this far and then
                     # fail with too little values to unpack.
-                    for callback, cb_mod_name, liftid, scope in callbacks:
-                        if cb_mod_name != mod_name:
-                            # avoid processing objects that were imported into
-                            # this module but were not actually defined there
+                    for entry in callbacks:
+                        try:
+                            if len(entry) < 4:
+                                raise ValueError("invalid venusian attachment")
+                            callback, cb_mod_name, liftid, scope = entry[:4]
+                            source = attachment_source(entry, name)
+                            source_module = source.get("module", cb_mod_name)
+                            source_name = source.get("name", name)
+                            if source_name == mod_name:
+                                source_name = fullname
+                            lifted_from = source.get("lifted_from")
+                            if cb_mod_name != mod_name:
+                                # avoid processing objects that were imported
+                                # into this module but were not actually
+                                # defined there
+                                record(
+                                    mod_name,
+                                    source_name,
+                                    found_name=name,
+                                    category=category,
+                                    reason=REASON_WRONG_MODULE,
+                                    source_module=source_module,
+                                    source_name=source_name,
+                                    lifted_from=lifted_from,
+                                    scope=scope,
+                                )
+                                continue
+                            if (
+                                requested_categories is not None
+                                and category not in requested_categories
+                            ):
+                                record(
+                                    mod_name,
+                                    source_name,
+                                    found_name=name,
+                                    category=category,
+                                    reason=REASON_CATEGORY_FILTERED,
+                                    source_module=source_module,
+                                    source_name=source_name,
+                                    lifted_from=lifted_from,
+                                    scope=scope,
+                                )
+                                continue
+                            record(
+                                mod_name,
+                                source_name,
+                                found_name=name,
+                                category=category,
+                                status=DIAGNOSTIC_SELECTED,
+                                source_module=source_module,
+                                source_name=source_name,
+                                lifted_from=lifted_from,
+                                scope=scope,
+                            )
+                            try:
+                                callback(self, name, ob)
+                            except BaseException as exc:
+                                record(
+                                    mod_name,
+                                    source_name,
+                                    found_name=name,
+                                    category=category,
+                                    status=DIAGNOSTIC_ERROR,
+                                    reason=REASON_CALLBACK_ERROR,
+                                    source_module=source_module,
+                                    source_name=source_name,
+                                    lifted_from=lifted_from,
+                                    scope=scope,
+                                    error=exc,
+                                )
+                                raise
+                        except ValueError:
+                            record(
+                                mod_name,
+                                name,
+                                found_name=name,
+                                category=category,
+                                reason=REASON_INVALID_ATTACHMENT,
+                                status=DIAGNOSTIC_ERROR,
+                                error=sys.exc_info()[1],
+                            )
                             continue
-                        callback(self, name, ob)
                 except ValueError:  # pragma: nocover
                     continue
+
+        def scan_ignore(fullname):
+            reason = _ignore_reason(fullname)
+            if reason is not None:
+                record(
+                    fullname,
+                    None,
+                    reason=REASON_MODULE_IGNORED,
+                    status=DIAGNOSTIC_IGNORED,
+                )
+                return True
+            return False
 
         for name, ob in getmembers(package):
             # whether it's a module or a package, we need to scan its
@@ -198,7 +459,7 @@ class Scanner(object):
                 package.__path__,
                 package.__name__ + ".",
                 onerror=onerror,
-                ignore=_ignore,
+                ignore=scan_ignore,
             )
 
             for importer, modname, ispkg in results:
@@ -311,6 +572,12 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
     class_name = codeinfo[2]
 
     liftid = "%s %s" % (wrapped_name, name)
+    if scope == "class":
+        object_name = module_name + "." + class_name + "." + wrapped_name
+    elif wrapped_name is not None:
+        object_name = module_name + "." + wrapped_name
+    else:
+        object_name = module_name
 
     if scope == "class":
         # we're in the midst of a class statement
@@ -332,7 +599,13 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
             setattr(wrapped, ATTACH_ATTR, categories)
         callbacks = categories.setdefault(category, [])
 
-    callbacks.append((callback, module_name, liftid, scope))
+    source = {
+        "module": module_name,
+        "method": wrapped_name if scope == "class" else None,
+        "name": object_name,
+        "scope": scope,
+    }
+    callbacks.append((callback, module_name, liftid, scope, source))
 
     return AttachInfo(
         scope=scope,
@@ -502,11 +775,44 @@ class lift(object):
                             continue
                     callbacks = newcategories.get(cname, [])
                     newcallbacks = []
-                    for cb, _, liftid, cscope in category:
+                    for entry in category:
+                        cb, _, liftid, cscope = entry[:4]
                         append = True
-                        toappend = (cb, module_name, liftid, cscope)
+                        if len(entry) > 4:
+                            source = entry[4].copy()
+                        else:
+                            method = liftid.rsplit(" ", 1)[0]
+                            source = {
+                                "module": entry[1],
+                                "method": method,
+                                "name": entry[1] + "." + cls.__name__ + "." + method,
+                            }
+                        if cls is not wrapped:
+                            method = source.get("method")
+                            if method is None:
+                                lifted_from = cls.__module__ + "." + cls.__name__
+                            else:
+                                lifted_from = (
+                                    cls.__module__
+                                    + "."
+                                    + cls.__name__
+                                    + "."
+                                    + method
+                                )
+                            lift_path = source.setdefault("lift_path", [])
+                            if lifted_from not in lift_path:
+                                lift_path.append(lifted_from)
+                            source["lifted_from"] = lift_path[0]
+                        toappend = (
+                            cb,
+                            module_name,
+                            liftid,
+                            cscope,
+                            source,
+                        )
                         if cscope == "class":
-                            for ncb, _, nliftid, nscope in callbacks:
+                            for existing in callbacks:
+                                _, _, nliftid, nscope = existing[:4]
                                 if nscope == "class" and liftid == nliftid:
                                     append = False
                         if append:

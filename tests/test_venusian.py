@@ -693,6 +693,108 @@ class TestScanner(unittest.TestCase):
         )
         self.assertEqual(len(test.registrations), 0)
 
+    def test_diagnostic_report_explains_scan_fates(self):
+        from venusian import ScanReport
+        from tests.fixtures import diagnostics
+
+        report = ScanReport()
+        self._makeOne().scan(
+            diagnostics,
+            ignore=["tests.fixtures.diagnostics.ignored"],
+            diagnostic=report,
+        )
+
+        events = {
+            (event.found_module, event.found_name, event.category): event
+            for event in report.events
+        }
+
+        ignored = events[("tests.fixtures.diagnostics.ignored", None, None)]
+        self.assertEqual(ignored.status, "ignored")
+        self.assertEqual(ignored.reason, "module ignored")
+
+        reexported = events[
+            ("tests.fixtures.diagnostics.reexport", "reexported_function", None)
+        ]
+        self.assertEqual(reexported.status, "excluded")
+        self.assertEqual(reexported.reason, "defined in another module")
+        self.assertEqual(reexported.module, "tests.fixtures.diagnostics.reexport")
+        self.assertEqual(reexported.found_name, "reexported_function")
+        self.assertEqual(
+            reexported.source_module,
+            "tests.fixtures.diagnostics.definitions",
+        )
+        self.assertEqual(
+            reexported.source_name,
+            "tests.fixtures.diagnostics.definitions.function",
+        )
+
+        lifted = events[("tests.fixtures.diagnostics.inheritance", "Child", None)]
+        self.assertEqual(lifted.status, "selected")
+        self.assertEqual(lifted.scope, "class")
+        self.assertEqual(
+            lifted.name,
+            "tests.fixtures.diagnostics.inheritance.Parent.inherited",
+        )
+        self.assertEqual(
+            lifted.lifted_from,
+            "tests.fixtures.diagnostics.inheritance.Parent.inherited",
+        )
+
+        inherited = events[
+            ("tests.fixtures.diagnostics.inheritance", "NotLifted", None)
+        ]
+        self.assertEqual(inherited.status, "excluded")
+        self.assertEqual(inherited.reason, "inherited attachment")
+
+    def test_diagnostic_category_filtered(self):
+        from venusian import ScanReport
+        from tests.fixtures import category
+
+        report = ScanReport()
+        self._makeOne().scan(
+            category,
+            categories=("mycategory",),
+            diagnostic=report,
+        )
+
+        selected, excluded = sorted(report.events, key=lambda event: event.category)
+        self.assertEqual(selected.status, "selected")
+        self.assertEqual(selected.category, "mycategory")
+        self.assertEqual(excluded.status, "excluded")
+        self.assertEqual(excluded.reason, "category filtered")
+        self.assertEqual(excluded.category, "mycategory2")
+
+    def test_diagnostic_callback_error_is_not_an_exclusion(self):
+        from tests.fixtures import diagnostic_callback_error
+
+        events = []
+        self.assertRaises(
+            RuntimeError,
+            self._makeOne().scan,
+            diagnostic_callback_error,
+            diagnostic=events.append,
+        )
+
+        selected, error = events
+        self.assertEqual(selected.status, "selected")
+        self.assertIsNone(selected.error)
+        self.assertEqual(error.status, "error")
+        self.assertEqual(error.reason, "callback error")
+        self.assertIsInstance(error.error, RuntimeError)
+
+    def test_diagnostic_report_limit_marks_truncation(self):
+        from venusian import ScanReport
+        from tests.fixtures import category
+
+        report = ScanReport(limit=1)
+        self._makeOne().scan(category, diagnostic=report)
+
+        self.assertEqual(len(report.events), 1)
+        self.assertEqual(report.events[0].status, "excluded")
+        self.assertIn("truncated", report.events[0].reason)
+        self.assertIn("1", report.events[0].reason)
+
     def test_lifting1(self):
         from tests.fixtures import lifting1
 
