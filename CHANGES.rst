@@ -1,6 +1,18 @@
 3.2.0 (unreleased)
 ------------------
 
+- Add attachment handles.  The ``AttachInfo`` object returned by
+  ``venusian.attach`` now has an ``attachment`` attribute, a
+  ``venusian.Attachment`` handle representing exactly that one attachment.
+  Calling the handle's ``detach()`` method removes precisely that
+  attachment again (never other attachments of the same callback), which
+  allows subsystems to be stopped at runtime.  Lifted copies made by the
+  ``lift`` class decorator onto subclasses are independent attachments
+  and are not removed by detaching the original handle.  Handles only
+  hold weak references, so they don't keep the wrapped object alive;
+  detaching after the wrapped object has been garbage collected is a
+  no-op returning ``False``.
+
 - Remove support for Python 3.7 and 3.8.
 
 3.1.1 (2024-12-01)

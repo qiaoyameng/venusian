@@ -1,4 +1,5 @@
 import sys
+import weakref
 from inspect import getmembers, getmro, isclass
 from pkgutil import iter_modules
 
@@ -178,7 +179,7 @@ class Scanner(object):
                 try:
                     # Metaclasses might trick us by reaching this far and then
                     # fail with too little values to unpack.
-                    for callback, cb_mod_name, liftid, scope in callbacks:
+                    for callback, cb_mod_name, liftid, scope, *_token in callbacks:
                         if cb_mod_name != mod_name:
                             # avoid processing objects that were imported into
                             # this module but were not actually defined there
@@ -270,10 +271,64 @@ class AttachInfo(object):
       ``('/home/chrism/projects/venusian/tests/test_advice.py', 81,
       'testCallInfo', 'add_handler(foo, bar)')``
 
+    ``attachment``
+
+      An instance of :class:`venusian.Attachment`.  It is a handle
+      representing exactly the attachment made by the :func:`venusian.attach`
+      call which returned this info; its ``detach()`` method removes that
+      single attachment again.
+
+      .. versionadded:: 3.2.0
+
     """
 
     def __init__(self, **kw):
         self.__dict__.update(kw)
+
+
+class Attachment(object):
+    """
+    A handle for a single attachment made by :func:`venusian.attach`.
+    Instances of this class are not created directly; they are available
+    as the ``attachment`` attribute of the :class:`venusian.AttachInfo`
+    instance returned by :func:`venusian.attach`.
+
+    Each call to :func:`venusian.attach` creates a distinct attachment,
+    even if the same callback is attached to the same object more than
+    once.  Detaching a handle removes exactly the one attachment it
+    represents; other attachments of the same callback are left alone.
+
+    Copies of a callback made by the :class:`venusian.lift` class
+    decorator onto subclasses are independent attachments: detaching the
+    handle of the original attachment does *not* remove lifted copies,
+    and detaching a handle never touches any object other than the one
+    the attachment was made on.
+
+    The handle only holds a weak reference to the attachment registry of
+    the wrapped object, so keeping a handle around does not prevent the
+    wrapped object (for example a class) from being garbage collected.
+    If the wrapped object has been garbage collected, :meth:`detach` is
+    a no-op returning ``False``.
+
+    .. versionadded:: 3.2.0
+    """
+
+    def __init__(self, categories, category, token):
+        self._categories = weakref.ref(categories)
+        self._category = category
+        self._token = token
+
+    def detach(self):
+        """Remove exactly the attachment represented by this handle.
+
+        Return ``True`` if the attachment was found and removed, or
+        ``False`` if it had already been detached or the wrapped object
+        has been garbage collected.
+        """
+        categories = self._categories()
+        if categories is None:
+            return False
+        return categories.detach(self._category, self._token)
 
 
 class Categories(dict):
@@ -290,6 +345,21 @@ class Categories(dict):
             return self.attached_id == id(obj)
         return self.attached_id == (mod_name, name)
 
+    def detach(self, category, token):
+        """Remove the single callback entry identified by ``token`` from
+        ``category``.  The token is compared by identity, never by
+        callback equality, so other attachments of the same callback are
+        not affected.  Return ``True`` if an entry was removed, ``False``
+        otherwise."""
+        callbacks = self.get(category)
+        if not callbacks:
+            return False
+        for position, entry in enumerate(callbacks):
+            if len(entry) > 4 and entry[4] is token:
+                del callbacks[position]
+                return True
+        return False
+
 
 def attach(wrapped, callback, category=None, depth=1, name=None):
     """Attach a callback to the wrapped object.  It will be found
@@ -302,6 +372,12 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
     ``name`` should be ``None`` or a string representing a subcategory within
     the category.  This will be used by the ``lift`` class decorator to
     determine if decorations of a method should be inherited or overridden.
+
+    The returned :class:`venusian.AttachInfo` instance has an
+    ``attachment`` attribute, a handle which represents this particular
+    attachment.  Calling the handle's ``detach()`` method removes exactly
+    this attachment again, which is useful when a subsystem needs to be
+    stopped at runtime.  See :class:`venusian.Attachment`.
     """
 
     frame = sys._getframe(depth + 1)
@@ -332,7 +408,8 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
             setattr(wrapped, ATTACH_ATTR, categories)
         callbacks = categories.setdefault(category, [])
 
-    callbacks.append((callback, module_name, liftid, scope))
+    token = object()
+    callbacks.append((callback, module_name, liftid, scope, token))
 
     return AttachInfo(
         scope=scope,
@@ -341,6 +418,7 @@ def attach(wrapped, callback, category=None, depth=1, name=None):
         globals=f_globals,
         category=category,
         codeinfo=codeinfo,
+        attachment=Attachment(categories, category, token),
     )
 
 
@@ -502,11 +580,12 @@ class lift(object):
                             continue
                     callbacks = newcategories.get(cname, [])
                     newcallbacks = []
-                    for cb, _, liftid, cscope in category:
+                    for cb, _, liftid, cscope, *rest in category:
+                        token = rest[0] if rest else None
                         append = True
-                        toappend = (cb, module_name, liftid, cscope)
+                        toappend = (cb, module_name, liftid, cscope, token)
                         if cscope == "class":
-                            for ncb, _, nliftid, nscope in callbacks:
+                            for ncb, _, nliftid, nscope, *_t in callbacks:
                                 if nscope == "class" and liftid == nliftid:
                                     append = False
                         if append:

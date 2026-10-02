@@ -9,6 +9,10 @@ API Documentation for Venusian
 
   .. autoclass:: AttachInfo
 
+  .. autoclass:: Attachment
+
+     .. automethod:: detach
+
   .. autofunction:: attach(wrapped, callback, category=None, name=None)
 
   .. autoclass:: lift

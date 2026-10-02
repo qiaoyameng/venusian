@@ -947,6 +947,159 @@ class Test_lift(unittest.TestCase):
         self.assertRaises(RuntimeError, inst, None)
 
 
+class TestAttachment(unittest.TestCase):
+    def _makeScanner(self, **kw):
+        from venusian import Scanner
+
+        return Scanner(**kw)
+
+    def _fixture(self):
+        from tests.fixtures import detach
+
+        return detach
+
+    def test_attach_info_still_provides_classic_attributes(self):
+        fixture = self._fixture()
+
+        def callback(scanner, name, ob):  # pragma: no cover
+            pass
+
+        def target():
+            pass
+
+        info = fixture.attach(target, callback, category="mycat", name="nm")
+        self.assertEqual(info.scope, "function call")
+        self.assertEqual(info.module, fixture)
+        self.assertEqual(info.category, "mycat")
+        self.assertEqual(info.globals, fixture.__dict__)
+        self.assertTrue("wrapped" in info.locals)
+        self.assertEqual(len(info.codeinfo), 4)
+        from venusian import Attachment
+
+        self.assertIsInstance(info.attachment, Attachment)
+
+    def test_attach_twice_detach_once_scans_once(self):
+        fixture = self._fixture()
+        calls = []
+
+        def callback(scanner, name, ob):
+            calls.append((name, ob))
+
+        def target():
+            pass
+
+        fixture.target = target
+        try:
+            info1 = fixture.attach(target, callback, category="doublecat")
+            info2 = fixture.attach(target, callback, category="doublecat")
+            self.assertIsNot(info1.attachment, info2.attachment)
+            # detaching one handle must not remove the other attachment
+            # of the very same callback
+            self.assertTrue(info1.attachment.detach())
+            scanner = self._makeScanner()
+            scanner.scan(fixture, categories=["doublecat"])
+            self.assertEqual(calls, [("target", target)])
+            # detaching the second handle removes the remaining attachment
+            self.assertTrue(info2.attachment.detach())
+            del calls[:]
+            scanner.scan(fixture, categories=["doublecat"])
+            self.assertEqual(calls, [])
+            # detach is idempotent
+            self.assertFalse(info1.attachment.detach())
+            self.assertFalse(info2.attachment.detach())
+        finally:
+            del fixture.target
+
+    def test_detach_in_class_scope(self):
+        fixture = self._fixture()
+        calls = []
+
+        def callback(scanner, name, ob):
+            calls.append((name, ob))
+
+        klass, infos = fixture.make_double_decorated_class(callback, "classcat")
+        fixture.Klass = klass
+        try:
+            self.assertEqual(len(infos), 2)
+            self.assertTrue(infos[0].attachment.detach())
+            scanner = self._makeScanner()
+            scanner.scan(fixture, categories=["classcat"])
+            self.assertEqual(calls, [("Klass", klass)])
+        finally:
+            del fixture.Klass
+
+    def test_detach_does_not_remove_lifted_copies(self):
+        fixture = self._fixture()
+        calls = []
+
+        def callback(scanner, name, ob):
+            calls.append(name)
+
+        Super, Sub, infos = fixture.make_lifted_classes(callback, "liftcat")
+        fixture.Super = Super
+        fixture.Sub = Sub
+        try:
+            scanner = self._makeScanner()
+            scanner.scan(fixture, categories=["liftcat"])
+            self.assertEqual(sorted(calls), ["Sub", "Super"])
+            # detaching the original attachment leaves the lifted copy
+            # on the subclass alone
+            del calls[:]
+            self.assertTrue(infos[0].attachment.detach())
+            scanner.scan(fixture, categories=["liftcat"])
+            self.assertEqual(calls, ["Sub"])
+        finally:
+            del fixture.Super
+            del fixture.Sub
+
+    def test_handle_does_not_keep_wrapped_function_alive(self):
+        import gc
+        import weakref
+
+        fixture = self._fixture()
+
+        def callback(scanner, name, ob):  # pragma: no cover
+            pass
+
+        def make_handle():
+            def target():
+                pass
+
+            info = fixture.attach(target, callback, category="gccat")
+            return info.attachment, weakref.ref(target)
+
+        handle, ref = make_handle()
+        gc.collect()
+        self.assertIsNone(ref())
+        # the wrapped object is gone; detaching is a graceful no-op
+        self.assertFalse(handle.detach())
+
+    def test_handle_and_info_do_not_keep_class_alive(self):
+        import gc
+        import weakref
+
+        fixture = self._fixture()
+
+        def callback(scanner, name, ob):  # pragma: no cover
+            pass
+
+        def make_info():
+            klass, infos = fixture.make_double_decorated_class(callback, "gccat2")
+            return infos[0], weakref.ref(klass)
+
+        info, ref = make_info()
+        gc.collect()
+        # the class itself is collectable even while the AttachInfo
+        # (and thus the handle) is still around
+        self.assertIsNone(ref())
+        handle = info.attachment
+        del info
+        gc.collect()
+        # with the info gone, nothing keeps the callback registry alive
+        # either; detaching is a graceful no-op
+        self.assertFalse(handle.detach())
+
+
 class Test_onlyliftedfrom(unittest.TestCase):
     def _makeOne(self):
         from venusian import onlyliftedfrom
